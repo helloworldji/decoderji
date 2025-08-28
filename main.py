@@ -31,20 +31,22 @@ async def decode_with_gemini(code_or_text):
     try:
         model = genai.GenerativeModel('gemini-1.5-pro')
         
+        # IMPROVED PROMPT
         prompt = (
-            "I have an encoded, obfuscated, or encrypted Python script. "
-            "Your task is to decode it and return the original, "
-            "readable Python code. The encoding method is unknown but may include "
-            "base64, marshal, exec, pyarmor, or nested variations. "
-            "Do not add any explanations or comments, just the clean, decoded code. "
-            "If the code is already clean, return it as is. "
-            "If you cannot decode it, return a single phrase: 'Decoding failed.'\n\n"
-            "Here is the code to decode:\n\n"
+            "You are an expert Python reverse-engineer. Your task is to analyze and decode "
+            "the following obfuscated or encoded Python code. The code might be nested or use "
+            "multiple layers of encoding such as base64, marshal, or `exec` calls. "
+            "Your output must ONLY be the clean, original, readable Python code. "
+            "Do not include any explanations, comments, or extra text. "
+            "If the provided code is already readable, return it as-is. "
+            "If you are unable to decode it, return a single phrase: 'Decoding failed.'\n\n"
+            "Here is the obfuscated code:\n\n"
             f"```python\n{code_or_text}\n```"
         )
         
-        response = model.generate_content(prompt)
+        response = await model.generate_content(prompt)
         
+        # Check if response is valid and get the text
         if response and response.text:
             cleaned_text = response.text.strip().replace("```python", "").replace("```", "").strip()
             if "Decoding failed." in cleaned_text:
