@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import BufferedInputFile
+from aiogram.filters import Command
 import google.generativeai as genai
 
 # Load environment variables from .env file
@@ -18,6 +19,8 @@ genai.configure(api_key=GEMINI_API_KEY)
 # Initialize Bot and Dispatcher
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+# ---------------------------------------------------------------------
 
 # --- Gemini API interaction function ---
 async def decode_with_gemini(code_or_text):
@@ -52,9 +55,11 @@ async def decode_with_gemini(code_or_text):
         print(f"Gemini API error: {e}")
         return None
 
+# ---------------------------------------------------------------------
+
 # --- Telegram Bot Handlers ---
 
-@dp.message(commands=['start'])
+@dp.message(Command('start'))
 async def start_command(message: types.Message):
     """Handles the /start command."""
     await message.answer(
@@ -127,6 +132,8 @@ async def handle_text(message: types.Message):
             await message.answer("❌ Could not decode the code. The code might be too complex or already clean.")
     else:
         await message.answer("Please send a valid code snippet or file.")
+
+# ---------------------------------------------------------------------
 
 # --- Main function to run the bot ---
 async def main() -> None:
