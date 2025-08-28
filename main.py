@@ -2,7 +2,7 @@ import os
 import io
 from dotenv import load_dotenv
 import asyncio
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import BufferedInputFile
 from aiogram.filters import Command
 import google.generativeai as genai
@@ -70,7 +70,7 @@ async def start_command(message: types.Message):
         "Created by @aadi.io"
     )
 
-@dp.message(types.ContentType.DOCUMENT)
+@dp.message(F.document)
 async def handle_document(message: types.Message):
     """Handles uploaded files."""
     if message.document.mime_type in ['text/x-python', 'text/plain']:
