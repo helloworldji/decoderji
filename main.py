@@ -1,206 +1,88 @@
-# main.py
-
-import asyncio
-import logging
-import base64
-import urllib.parse
-import html
-import codecs
 import os
-
+import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
+from dotenv import load_dotenv
+
+# Load environment variables from a .env file (for local testing only)
+# On Render, this file is ignored, and you will set BOT_TOKEN directly 
+# in the environment variables (Secrets).
+load_dotenv()
 
 # --- Configuration ---
-# IMPORTANT: It's best practice to set this as an environment variable on your hosting service.
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+# Your bot token MUST be set as an environment variable named BOT_TOKEN
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- Logging Setup ---
-# This sets up basic logging to see the bot's activity and any potential errors in your console.
+if not BOT_TOKEN:
+    # Exit if the token is not found (required for deployment)
+    raise ValueError("Error: BOT_TOKEN environment variable not found. Please set it in Render secrets.")
+
+# Set up logging for easier debugging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# Disable logging for the underlying Telegram library for cleaner output
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
-
-# --- Decoding Functions ---
-# Each function tries a specific decoding method.
-# If it fails, it returns the original text, allowing the process to continue.
-
-def decode_base64(text: str) -> str:
-    """Tries to decode a Base64 encoded string."""
-    try:
-        # We need to add padding if it's missing for valid Base64.
-        missing_padding = len(text) % 4
-        if missing_padding:
-            text += '=' * (4 - missing_padding)
-        decoded_bytes = base64.b64decode(text)
-        return decoded_bytes.decode('utf-8')
-    except (UnicodeDecodeError, base64.binascii.Error, ValueError):
-        return text
-
-def decode_url(text: str) -> str:
-    """Tries to decode a URL-encoded (percent-encoded) string."""
-    try:
-        decoded_text = urllib.parse.unquote(text)
-        # Only return if it actually changed something
-        return decoded_text if decoded_text != text else text
-    except Exception:
-        return text
-
-def decode_html_entities(text: str) -> str:
-    """Tries to decode HTML entities (e.g., &amp; -> &)."""
-    try:
-        decoded_text = html.unescape(text)
-        return decoded_text if decoded_text != text else text
-    except Exception:
-        return text
-
-def decode_rot13(text: str) -> str:
-    """Decodes a ROT13 ciphered string."""
-    try:
-        return codecs.decode(text, 'rot_13')
-    except Exception:
-        return text
-
-def decode_hex(text: str) -> str:
-    """Tries to decode a hex string into text."""
-    try:
-        # Remove common hex prefixes if they exist
-        if text.lower().startswith('0x'):
-            text = text[2:]
-        
-        # Ensure it's a valid hex string (even number of chars, only hex digits)
-        if len(text) % 2 == 0 and all(c in '0123456789abcdefABCDEF' for c in text):
-             return bytes.fromhex(text).decode('utf-8')
-        return text
-    except (ValueError, UnicodeDecodeError):
-        return text
-
-# --- Core Decoding Logic ---
-
-async def decode_aggressively(original_text: str) -> (str, list):
-    """
-    Continuously applies all decoding methods until the text stops changing.
-    This handles multi-layered encoding.
-    """
-    current_text = original_text
-    decoding_steps = []
-    
-    # A list of all decoding functions to try, in order.
-    decoders = {
-        "Base64": decode_base64,
-        "URL Encoding": decode_url,
-        "Hex": decode_hex,
-        "HTML Entities": decode_html_entities,
-        "ROT13 Cipher": decode_rot13,
-    }
-
-    # Loop until a full pass over the text results in no changes.
-    while True:
-        text_before_pass = current_text
-        for name, decoder_func in decoders.items():
-            decoded_text = decoder_func(current_text)
-            # If the text was changed by the decoder, we've made progress.
-            if decoded_text != current_text:
-                decoding_steps.append(f"✅ Decoded with: <b>{name}</b>")
-                current_text = decoded_text
-                # Break the inner loop and start a new pass from the beginning
-                # with the newly decoded text.
-                break 
-        
-        # If the inner loop completed without any changes, we are done.
-        if text_before_pass == current_text:
-            break
-            
-    return current_text, decoding_steps
-
-
-# --- Telegram Bot Handlers ---
+# --- Handlers (Functions that respond to events) ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the /start command is issued."""
+    """Sends a greeting message when the /start command is issued."""
     user = update.effective_user
-    welcome_message = (
-        f"👋 Hello {user.mention_html()}!\n\n"
-        "I am the Multi-Decoder Bot. Send me any encoded text, and I will do my best to decode it for you.\n\n"
-        "I can handle multiple layers of encoding like Base64, URL, Hex, and more. Just paste the text and send!"
+    logger.info(f"Received /start command from user: {user.username or user.id}")
+    await update.message.reply_html(
+        f"Hello, {user.mention_html()}! I am your new Python Telegram Bot. I can echo any text you send me. Use /help for more info.",
     )
-    await update.message.reply_html(welcome_message)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """The main function to handle incoming text messages."""
-    input_text = update.message.text
-    
-    logger.info(f"Received message from {update.effective_user.username}: {input_text}")
-    
-    # Show a "typing..." status to the user.
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    
-    final_text, steps = await decode_aggressively(input_text)
-    
-    if not steps:
-        response_message = (
-            "🤔 <b>No Encoding Detected</b>\n\n"
-            "I tried several methods, but the text doesn't seem to be encoded in a way I recognize, or it's already decoded.\n\n"
-            f"<b>Original Text:</b>\n<pre>{html.escape(input_text)}</pre>"
-        )
-    else:
-        steps_text = "\n".join(steps)
-        response_message = (
-            "🎉 <b>Decoding Complete!</b>\n\n"
-            "<b>Decoding Path:</b>\n"
-            f"{steps_text}\n\n"
-            "<b>Final Decoded Text:</b>\n"
-            f"<pre>{html.escape(final_text)}</pre>"
-        )
-        
-    await update.message.reply_html(response_message)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a help message when the /help command is issued."""
+    logger.info(f"Received /help command from user: {update.effective_user.username or update.effective_user.id}")
+    await update.message.reply_text("This bot is running in a polling mode on a continuous server (like your setup on Render/UptimeRobot).\n\nAvailable Commands:\n/start - Say hello\n/help - Show this message\n\nJust send me any message, and I'll echo it back!")
 
+async def echo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Echoes the user message back to the chat."""
+    # Check if the update contains a message and text
+    if update.message and update.message.text:
+        text = update.message.text
+        logger.info(f"Received message from {update.effective_user.username or update.effective_user.id}: {text}")
+        await update.message.reply_text(f"You said: {text}")
 
-async def main() -> None:
-    """Starts the bot using webhooks for deployment."""
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        logger.error("FATAL: TELEGRAM_BOT_TOKEN is not set. Please set it as an environment variable.")
-        return
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Errors caused by Updates."""
+    logger.warning(f'Update "{update}" caused error "{context.error}"')
 
-    # The PORT is usually assigned by the hosting service. Default to 8443 for local testing.
-    PORT = int(os.environ.get('PORT', '8443'))
-    
-    # This is the public URL of your deployed application provided by Render.
-    # e.g., https://your-app-name.onrender.com
-    WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
+# --- Main Bot Logic ---
 
-    if not WEBHOOK_URL:
-        logger.error("FATAL: WEBHOOK_URL environment variable not set. This is required for webhook deployment.")
-        return
+def main() -> None:
+    """Start the bot using Long Polling, suitable for a continuous service like Render."""
 
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # 1. Create the Application and pass it your bot's token.
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # 2. Register Handlers (Order matters for some handlers, but not these)
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Set up the webhook by telling Telegram where to send updates.
-    # The URL path should be secret; the bot token is a good choice.
-    webhook_full_url = f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}"
-    await application.bot.set_webhook(url=webhook_full_url)
+    application.add_handler(CommandHandler("help", help_command))
     
-    logger.info(f"Webhook set to {webhook_full_url}")
-    logger.info(f"Bot is starting web server on port {PORT}...")
+    # MessageHandler handles all text messages that are NOT commands
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_message))
 
-    # Run the bot as a web server.
-    # It will listen on 0.0.0.0 to accept connections from the hosting service.
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TELEGRAM_BOT_TOKEN
-    )
+    # Error handler
+    application.add_error_handler(error_handler)
+
+    # 3. Start Polling
+    # This keeps the application running 24/7, constantly checking for new messages.
+    # This is the ideal "Start Command" for a continuous worker on Render.
+    print("Bot starting... Listening for Telegram updates via long polling.")
+    
+    # The application.run_polling() is a synchronous blocking call that runs the bot until manually stopped.
+    # This is the ideal "Start Command" for a continuous worker on Render.
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == '__main__':
-    # Use asyncio.run to execute the async main function.
-    asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Failed to start the bot: {e}")
