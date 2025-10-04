@@ -13,7 +13,7 @@ logging.basicConfig(
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the command /start is issued."""
     # Note: Replace 'Hello! Welcome to the bot.' with your actual welcome message
-    await update.message.reply_text('Hello! Welcome to the bot. This is the new v20 structure.')
+    await update.message.reply_text('Hello! Welcome to the bot. Using the Webhook setup now.')
 
 # Define the main function to run the bot
 def main() -> None:
@@ -21,9 +21,12 @@ def main() -> None:
     # Load environment variables (like BOT_TOKEN) from .env file
     load_dotenv()
     
-    # 1. Get the bot token from environment variables
-    # Ensure you have BOT_TOKEN set in your environment or a .env file
+    # 1. Get required environment variables
     token = os.environ.get("BOT_TOKEN")
+    
+    # Render provides PORT and WEBHOOK_URL
+    port = int(os.environ.get("PORT", 8080))
+    webhook_url = os.environ.get("WEBHOOK_URL")
 
     if not token:
         logging.error("BOT_TOKEN not found in environment variables. Cannot start the bot.")
@@ -33,18 +36,30 @@ def main() -> None:
     application = Application.builder().token(token).build()
 
     # 3. REGISTER HANDLERS
-    # Replaces dispatcher.add_handler()
     application.add_handler(CommandHandler("start", start_command))
 
-    # 4. START THE BOT (using polling for simplicity, replaces updater.start_polling())
-    # If you need a webhook for Render, you would use application.run_webhook(...) here instead.
-    try:
-        logging.info("Starting bot using polling...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception as e:
-        # This will catch the previous error if it was still using the old structure, 
-        # but with the new structure, it should handle runtime exceptions.
-        logging.error(f"Failed to start the bot: {e}")
+    # 4. START THE BOT (Web service requires Webhook setup)
+    if webhook_url:
+        logging.info(f"Starting bot using webhook at {webhook_url} on port {port}...")
+        
+        # The url_path should be unique and secure. Using the token is a common practice.
+        url_path = token
+        
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=f"{webhook_url}{url_path}",
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # Fallback to polling for local development if WEBHOOK_URL is not set
+        logging.info("WEBHOOK_URL not set. Falling back to local polling...")
+        try:
+            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        except Exception as e:
+            logging.error(f"Failed to start local polling: {e}")
+
 
 if __name__ == "__main__":
     main()
