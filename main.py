@@ -48,8 +48,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 def get_best_model():
     """Get the best available Gemini model."""
     try:
-        logger.info("🔍 Searching for available Gemini models...")
-        
         available = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
@@ -64,27 +62,25 @@ def get_best_model():
         
         for pref in preferred:
             if pref in available:
-                logger.info(f"✅ Selected: {pref}")
+                logger.info(f"✅ Model: {pref}")
                 return pref
         
         if available:
             return available[0]
-            
     except Exception as e:
-        logger.warning(f"⚠️ Could not list models: {e}")
+        logger.warning(f"⚠️ Model listing failed: {e}")
     
     return 'models/gemini-pro'
 
 MODEL_NAME = get_best_model()
 model = genai.GenerativeModel(MODEL_NAME)
-logger.info(f"🤖 Initialized: {MODEL_NAME}")
 
 # --- Constants ---
-CREDIT = "🔧 Dev: @aadi_io"
-MAX_FILE_SIZE = 5 * 1024 * 1024
-MAX_CODE_LENGTH = 30000
-DECODER_TIMEOUT = 45
-MAX_DECODE_ITERATIONS = 5  # Keep decoding up to 5 times
+CREDIT = "Dev: @aadi_io"
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+MAX_CODE_LENGTH = 100000  # 100K chars
+DECODER_TIMEOUT = 60
+MAX_DECODE_ITERATIONS = 50  # Very high limit for complex files
 
 # --- Global Bot Application ---
 telegram_app: Optional[Application] = None
@@ -92,16 +88,16 @@ telegram_app: Optional[Application] = None
 
 # --- Helper Functions ---
 def is_code_obfuscated(code: str) -> bool:
-    """Check if code still contains obfuscation patterns."""
+    """Check if code still contains obfuscation."""
     if not code or len(code) < 10:
         return True
     
-    # Common obfuscation indicators
     obfuscation_patterns = [
         r'exec\s*KATEX_INLINE_OPEN',
         r'eval\s*KATEX_INLINE_OPEN',
         r'compile\s*KATEX_INLINE_OPEN',
-        r'__import__\s*KATEX_INLINE_OPEN',
+        r'__import__\s*KATEX_INLINE_OPEN[\'"]base64',
+        r'__import__\s*KATEX_INLINE_OPEN[\'"]marshal',
         r'base64\.b64decode',
         r'base64\.b32decode',
         r'base64\.b16decode',
@@ -110,58 +106,51 @@ def is_code_obfuscated(code: str) -> bool:
         r'pickle\.loads',
         r'zlib\.decompress',
         r'gzip\.decompress',
+        r'bz2\.decompress',
         r'lambda\s+.*:\s*exec',
         r'lambda\s+.*:\s*eval',
-        r'\\x[0-9a-fA-F]{2}',  # Hex encoding
-        r'chr\s*KATEX_INLINE_OPEN\s*\d+\s*KATEX_INLINE_CLOSE',  # Character encoding
-        r'ord\s*KATEX_INLINE_OPEN',  # Ordinal encoding
         r'bytes\.fromhex',
-        r'int\s*KATEX_INLINE_OPEN.*,\s*16\s*KATEX_INLINE_CLOSE',  # Hex to int
+        r'bytearray\.fromhex',
+        r'intKATEX_INLINE_OPEN.*,\s*16KATEX_INLINE_CLOSE',
     ]
     
-    code_lower = code.lower()
-    
-    # Check for patterns
     for pattern in obfuscation_patterns:
         if re.search(pattern, code, re.IGNORECASE):
-            logger.info(f"Found obfuscation pattern: {pattern}")
+            logger.info(f"Obfuscation detected: {pattern}")
             return True
     
-    # Check for suspicious base64-like strings
-    base64_like = re.findall(r"['\"]([A-Za-z0-9+/=]{50,})['\"]", code)
-    if base64_like:
-        logger.info(f"Found {len(base64_like)} potential base64 strings")
+    # Check for base64-like strings
+    base64_matches = re.findall(r"['\"]([A-Za-z0-9+/=]{100,})['\"]", code)
+    if base64_matches:
+        logger.info(f"Found {len(base64_matches)} base64-like strings")
         return True
     
-    # Check for excessive string concatenation (common in obfuscation)
-    if code.count("'+'") > 10 or code.count('"+') > 10:
-        logger.info("Found excessive string concatenation")
+    # Check for excessive string operations
+    if code.count("chr(") > 20 or code.count("ord(") > 20:
+        logger.info("Found excessive chr/ord usage")
         return True
     
-    logger.info("✅ Code appears to be clean (no obfuscation detected)")
+    logger.info("✅ Code appears clean")
     return False
 
 
 def clean_code_response(text: str) -> str:
-    """Clean up AI response."""
+    """Clean AI response."""
     text = text.strip()
-    
     if text.startswith("```python"):
         text = text[9:]
     elif text.startswith("```"):
         text = text[3:]
-    
     if text.endswith("```"):
         text = text[:-3]
-    
     return text.strip()
 
 
 def extract_response_text(response) -> tuple[bool, str]:
-    """Safely extract text from Gemini response."""
+    """Extract text from Gemini response."""
     try:
         if not response or not hasattr(response, 'candidates') or not response.candidates:
-            return False, "No response from API"
+            return False, "No response"
         
         candidate = response.candidates[0]
         
@@ -171,71 +160,64 @@ def extract_response_text(response) -> tuple[bool, str]:
                 for part in candidate.content.parts:
                     if hasattr(part, 'text'):
                         text_parts.append(part.text)
-                
                 if text_parts:
                     return True, ''.join(text_parts)
         
-        return False, "Could not extract response text"
-        
+        return False, "No text in response"
     except Exception as e:
         return False, str(e)
 
 
-async def generate_iterative_decoder(code: str) -> tuple[bool, str]:
-    """Generate a decoder that keeps decoding until code is fully clean."""
+async def generate_universal_decoder(code: str) -> tuple[bool, str]:
+    """Generate a powerful universal decoder."""
     try:
-        logger.info("🔧 Generating iterative decoder...")
+        logger.info("🔧 Generating universal decoder...")
         
-        code_sample = code[:15000] if len(code) > 15000 else code
+        code_sample = code[:20000] if len(code) > 20000 else code
         
-        # Enhanced prompt for complete decoding
         prompt = (
-            "You are a Python deobfuscation expert. Create a COMPLETE decoder script that will "
-            "FULLY decode ALL layers of obfuscation until the code is completely readable.\n\n"
+            "Create a POWERFUL universal Python decoder that handles ALL obfuscation types.\n\n"
             
-            "CRITICAL REQUIREMENTS:\n"
-            "1. The decoder MUST iterate/loop until NO obfuscation remains\n"
-            "2. Handle ALL these methods: base64, exec, eval, marshal, zlib, gzip, hex, chr, compile\n"
-            "3. Detect and decode MULTIPLE layers automatically\n"
-            "4. Keep decoding until code has NO exec/eval/base64/marshal/etc.\n"
-            "5. Return ONLY clean, readable Python source code\n\n"
+            "REQUIREMENTS:\n"
+            "- Decode UNLIMITED layers automatically\n"
+            "- Handle: base64, hex, marshal, zlib, gzip, bz2, exec, eval, compile, pickle\n"
+            "- Loop until NO obfuscation remains\n"
+            "- Return ONLY clean readable code\n\n"
             
-            "DECODER TEMPLATE TO FOLLOW:\n"
+            "DECODER STRUCTURE:\n"
             "```python\n"
-            "import base64, marshal, zlib, gzip, re, codecs\n"
-            "import sys\n\n"
+            "import base64, marshal, zlib, gzip, bz2, pickle, codecs, re, binascii\n\n"
             
-            "def is_still_obfuscated(code):\n"
-            "    '''Check if code still has obfuscation'''\n"
-            "    patterns = [r'exec\KATEX_INLINE_OPEN', r'eval\KATEX_INLINE_OPEN', r'base64\\.', r'marshal\\.', r'zlib\\.']\n"
-            "    return any(re.search(p, code) for p in patterns)\n\n"
+            "def is_obfuscated(s):\n"
+            "    patterns = ['exec(', 'eval(', 'base64.', 'marshal.', 'compile(']\n"
+            "    return any(p in str(s) for p in patterns)\n\n"
             
-            "def decode_layer(code):\n"
-            "    '''Decode one layer of obfuscation'''\n"
-            "    # Your decoding logic here\n"
-            "    # Handle base64, exec, eval, marshal, zlib, etc.\n"
-            "    return decoded_code\n\n"
+            "def decode_all_layers(code):\n"
+            "    iteration = 0\n"
+            "    max_iter = 100\n"
+            "    \n"
+            "    while iteration < max_iter:\n"
+            "        if not is_obfuscated(code):\n"
+            "            break\n"
+            "        \n"
+            "        # Try all decoding methods\n"
+            "        # base64, hex, marshal, zlib, exec extraction, etc.\n"
+            "        \n"
+            "        iteration += 1\n"
+            "    \n"
+            "    return code\n\n"
             
-            "# Read obfuscated code\n"
             "with open('obfuscated_code.txt', 'r') as f:\n"
-            "    code = f.read()\n\n"
+            "    original = f.read()\n\n"
             
-            "# Iteratively decode\n"
-            "max_iterations = 10\n"
-            "for i in range(max_iterations):\n"
-            "    if not is_still_obfuscated(code):\n"
-            "        break\n"
-            "    code = decode_layer(code)\n\n"
+            "decoded = decode_all_layers(original)\n\n"
             
-            "# Write fully decoded code\n"
             "with open('decoded_code.py', 'w') as f:\n"
-            "    f.write(code)\n"
+            "    f.write(decoded)\n"
             "```\n\n"
             
-            "OBFUSCATED CODE TO ANALYZE:\n"
-            f"{code_sample}\n\n"
-            
-            "Generate the COMPLETE iterative decoder script that will fully decode this code:"
+            f"OBFUSCATED CODE:\n{code_sample}\n\n"
+            "Generate the complete universal decoder:"
         )
 
         safety_settings = {
@@ -248,8 +230,7 @@ async def generate_iterative_decoder(code: str) -> tuple[bool, str]:
         generation_config = genai.types.GenerationConfig(
             temperature=0.3,
             top_p=0.9,
-            top_k=40,
-            max_output_tokens=8192,
+            max_output_tokens=16384,
         )
         
         loop = asyncio.get_event_loop()
@@ -266,246 +247,291 @@ async def generate_iterative_decoder(code: str) -> tuple[bool, str]:
         success, result = extract_response_text(response)
         
         if not success:
-            return False, f"Failed to generate decoder: {result}"
+            return False, result
         
-        decoder_script = clean_code_response(result)
+        decoder = clean_code_response(result)
         
-        if len(decoder_script) < 50:
-            return False, "Generated decoder is too short"
+        if len(decoder) < 50:
+            return False, "Decoder too short"
         
-        logger.info(f"✅ Generated iterative decoder ({len(decoder_script)} chars)")
-        return True, decoder_script
+        logger.info(f"✅ Generated decoder ({len(decoder)} chars)")
+        return True, decoder
         
     except Exception as e:
-        logger.error(f"❌ Error generating decoder: {e}")
+        logger.error(f"❌ Decoder generation error: {e}")
         return False, str(e)
 
 
 async def execute_decoder(decoder_script: str, obfuscated_code: str) -> tuple[bool, str]:
-    """Execute decoder and verify output is clean."""
+    """Execute decoder script."""
     try:
-        logger.info("⚙️ Executing decoder script...")
+        logger.info("⚙️ Executing decoder...")
         
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Write obfuscated code
-            obfuscated_file = os.path.join(temp_dir, "obfuscated_code.txt")
-            with open(obfuscated_file, 'w', encoding='utf-8') as f:
+            # Write files
+            with open(os.path.join(temp_dir, "obfuscated_code.txt"), 'w', encoding='utf-8') as f:
                 f.write(obfuscated_code)
             
-            # Write decoder
-            decoder_file = os.path.join(temp_dir, "decoder.py")
-            with open(decoder_file, 'w', encoding='utf-8') as f:
+            with open(os.path.join(temp_dir, "decoder.py"), 'w', encoding='utf-8') as f:
                 f.write(decoder_script)
             
             decoded_file = os.path.join(temp_dir, "decoded_code.py")
             
             # Execute
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                os.path.join(temp_dir, "decoder.py"),
+                cwd=temp_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
             try:
-                process = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    decoder_file,
-                    cwd=temp_dir,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
                     timeout=DECODER_TIMEOUT
                 )
-                
-                # Check output file
-                if os.path.exists(decoded_file):
-                    with open(decoded_file, 'r', encoding='utf-8') as f:
-                        decoded_code = f.read()
-                    
-                    if decoded_code.strip():
-                        logger.info(f"✅ Decoder produced output ({len(decoded_code)} chars)")
-                        return True, decoded_code
-                
-                # Check stdout
-                if stdout:
-                    decoded_code = stdout.decode('utf-8', errors='ignore')
-                    if len(decoded_code) > 20:
-                        return True, decoded_code
-                
-                # Log errors
-                if stderr:
-                    error_msg = stderr.decode('utf-8', errors='ignore')
-                    logger.error(f"Decoder stderr: {error_msg[:500]}")
-                    return False, f"Decoder error: {error_msg[:300]}"
-                
-                return False, "Decoder produced no output"
-                
             except asyncio.TimeoutError:
-                return False, "Decoder timeout (>45s)"
+                process.kill()
+                return False, "Timeout"
+            
+            # Read result
+            if os.path.exists(decoded_file):
+                with open(decoded_file, 'r', encoding='utf-8') as f:
+                    decoded = f.read()
+                if decoded.strip():
+                    logger.info(f"✅ Decoded: {len(decoded)} chars")
+                    return True, decoded
+            
+            if stdout:
+                decoded = stdout.decode('utf-8', errors='ignore')
+                if len(decoded) > 20:
+                    return True, decoded
+            
+            if stderr:
+                error = stderr.decode('utf-8', errors='ignore')
+                logger.error(f"Decoder error: {error[:300]}")
+                return False, error[:200]
+            
+            return False, "No output produced"
             
     except Exception as e:
         logger.error(f"❌ Execution error: {e}")
         return False, str(e)
 
 
-async def ensure_fully_decoded(code: str, max_attempts: int = 3) -> tuple[bool, str, list]:
-    """
-    Ensure code is COMPLETELY decoded with NO obfuscation remaining.
-    Returns: (success, final_code, decode_log)
-    """
-    decode_log = []
+async def full_decode(code: str, chat_id: int, message_id: int) -> tuple[bool, str, int]:
+    """Complete decoding with unlimited iterations."""
     current_code = code
+    total_iterations = 0
     
     for iteration in range(1, MAX_DECODE_ITERATIONS + 1):
-        logger.info(f"🔄 Decode iteration {iteration}/{MAX_DECODE_ITERATIONS}")
-        decode_log.append(f"Iteration {iteration}:")
+        logger.info(f"🔄 Iteration {iteration}/{MAX_DECODE_ITERATIONS}")
         
-        # Check if still obfuscated
+        # Update user every 5 iterations
+        if iteration % 5 == 0:
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"🔄 <b>Decoding in progress...</b>\n\nLayer {iteration} decoded\nPlease wait...",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        
+        # Check if clean
         if not is_code_obfuscated(current_code):
-            logger.info(f"✅ Code is fully decoded after {iteration-1} iteration(s)")
-            decode_log.append("✅ Code is fully clean - no more obfuscation detected!")
-            return True, current_code, decode_log
+            logger.info(f"✅ Fully decoded after {iteration} iterations")
+            return True, current_code, iteration
         
-        decode_log.append("⚠️ Obfuscation detected - generating decoder...")
-        
-        # Generate decoder for current state
-        success, decoder = await generate_iterative_decoder(current_code)
-        
+        # Generate decoder
+        success, decoder = await generate_universal_decoder(current_code)
         if not success:
-            decode_log.append(f"❌ Decoder generation failed: {decoder}")
-            if iteration == 1:
-                return False, current_code, decode_log
-            # Return best we have so far
-            return True, current_code, decode_log
-        
-        decode_log.append("✅ Decoder generated - executing...")
+            if iteration > 1:
+                logger.warning(f"Decoder gen failed at iteration {iteration}, returning current state")
+                return True, current_code, iteration
+            return False, f"Decoder generation failed: {decoder}", 0
         
         # Execute decoder
         success, decoded = await execute_decoder(decoder, current_code)
-        
         if not success:
-            decode_log.append(f"❌ Execution failed: {decoded}")
-            if iteration == 1:
-                return False, current_code, decode_log
-            # Return best we have so far
-            return True, current_code, decode_log
+            if iteration > 1:
+                logger.warning(f"Execution failed at iteration {iteration}, returning current state")
+                return True, current_code, iteration
+            return False, f"Execution failed: {decoded}", 0
         
-        # Check if we made progress
+        # Check progress
         if len(decoded) < 10:
-            decode_log.append("❌ Decoded output too short")
-            return True, current_code, decode_log
+            return True, current_code, iteration
         
         if decoded == current_code:
-            decode_log.append("⚠️ No change detected - stopping")
-            return True, current_code, decode_log
+            logger.info(f"No change at iteration {iteration}, stopping")
+            return True, current_code, iteration
         
-        decode_log.append(f"✅ Decoded {len(decoded)} chars - checking for more layers...")
         current_code = decoded
+        total_iterations = iteration
+        
+        # Small delay to prevent API rate limits
+        if iteration % 3 == 0:
+            await asyncio.sleep(2)
     
-    # Max iterations reached
-    decode_log.append(f"⚠️ Max iterations ({MAX_DECODE_ITERATIONS}) reached")
-    
-    if is_code_obfuscated(current_code):
-        decode_log.append("⚠️ Some obfuscation may remain")
-    else:
-        decode_log.append("✅ Code appears clean!")
-    
-    return True, current_code, decode_log
+    logger.info(f"Max iterations ({MAX_DECODE_ITERATIONS}) reached")
+    return True, current_code, total_iterations
 
 
 # --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message."""
-    welcome_text = (
-        "🤖 <b>Python Decoder Bot V3.0</b>\n\n"
-        "🔓 <b>GUARANTEED COMPLETE DECODING!</b>\n\n"
-        "I decode <b>EVERY layer</b> until code is <b>100% readable</b>!\n\n"
-        "<b>✨ Smart Features:</b>\n"
-        "• Detects obfuscation automatically\n"
-        "• Decodes iteratively (up to 5 layers)\n"
-        "• Validates output is clean\n"
-        "• Shows decoding progress\n\n"
-        "<b>🎯 Handles:</b>\n"
-        "✅ Base64/Hex/ROT13\n"
-        "✅ Exec/Eval wrappers\n"
-        "✅ Marshal/Zlib/Gzip\n"
-        "✅ Multi-layer obfuscation\n"
-        "✅ Mixed encoding\n\n"
-        "<b>📤 Usage:</b>\n"
-        "Send .py file or paste code\n\n"
-        f"<i>{CREDIT}</i>"
+    """Brief welcome message."""
+    await update.message.reply_text(
+        "🤖 <b>Python Decoder Bot</b>\n\n"
+        "Send obfuscated .py file or code.\n"
+        "I'll decode all layers automatically.\n\n"
+        f"<i>{CREDIT}</i>",
+        parse_mode="HTML"
     )
-    await update.message.reply_text(welcome_text, parse_mode="HTML")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help information."""
-    help_text = (
-        "<b>📖 Complete Decoding Bot</b>\n\n"
-        "<b>How It Works:</b>\n\n"
-        "1️⃣ <b>Analyze</b>\n"
-        "Detect obfuscation patterns\n\n"
-        "2️⃣ <b>Generate Decoder</b>\n"
-        "Create custom decoder script\n\n"
-        "3️⃣ <b>Execute & Verify</b>\n"
-        "Run decoder, check output\n\n"
-        "4️⃣ <b>Repeat If Needed</b>\n"
-        "Keep decoding until clean\n\n"
-        "5️⃣ <b>Validate</b>\n"
-        "Confirm NO obfuscation remains\n\n"
-        "<b>Commands:</b>\n"
-        "/start - Start bot\n"
-        "/help - This guide\n"
-        "/model - AI info\n\n"
-        f"<i>{CREDIT}</i>"
+    await update.message.reply_text(
+        "<b>Python Decoder Bot</b>\n\n"
+        "📤 Send: .py file or code text\n"
+        "⏳ Wait: 1-10 minutes (complex files)\n"
+        "📥 Receive: Fully decoded file\n\n"
+        "Features:\n"
+        "• Unlimited layers\n"
+        "• Auto-detection\n"
+        "• Background processing\n\n"
+        f"<i>{CREDIT}</i>",
+        parse_mode="HTML"
     )
-    await update.message.reply_text(help_text, parse_mode="HTML")
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show model info."""
-    info_text = (
-        f"<b>🤖 AI Configuration</b>\n\n"
-        f"<b>Model:</b> <code>{MODEL_NAME.split('/')[-1]}</code>\n"
-        f"<b>Mode:</b> Iterative Decoder\n"
-        f"<b>Max Iterations:</b> {MAX_DECODE_ITERATIONS}\n"
-        f"<b>Timeout:</b> {DECODER_TIMEOUT}s\n"
-        f"<b>Validation:</b> Enabled\n\n"
-        f"<i>{CREDIT}</i>"
+    """Model info."""
+    await update.message.reply_text(
+        f"<b>AI Model</b>\n\n"
+        f"Model: {MODEL_NAME.split('/')[-1]}\n"
+        f"Max Layers: {MAX_DECODE_ITERATIONS}\n"
+        f"Status: Active\n\n"
+        f"<i>{CREDIT}</i>",
+        parse_mode="HTML"
     )
-    await update.message.reply_text(info_text, parse_mode="HTML")
+
+
+# --- Background Processing Task ---
+async def process_decoding_task(chat_id: int, code: str, filename: str, status_msg_id: int):
+    """Background task for decoding."""
+    try:
+        logger.info(f"🚀 Starting background decode for chat {chat_id}")
+        
+        # Check if already clean
+        if not is_code_obfuscated(code):
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
+                tmp.write(code)
+                tmp_name = tmp.name
+            
+            try:
+                with open(tmp_name, 'rb') as f:
+                    await telegram_app.bot.send_document(
+                        chat_id=chat_id,
+                        document=InputFile(f, filename=filename),
+                        caption="✅ Code is already clean!\n\n" + CREDIT,
+                        parse_mode="HTML"
+                    )
+                await telegram_app.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+            finally:
+                os.remove(tmp_name)
+            return
+        
+        # Perform full decode
+        success, decoded_code, iterations = await full_decode(code, chat_id, status_msg_id)
+        
+        if not success:
+            await telegram_app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=status_msg_id,
+                text=f"❌ <b>Decoding Failed</b>\n\n{decoded_code[:300]}\n\nContact {CREDIT}",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Check final status
+        still_obfuscated = is_code_obfuscated(decoded_code)
+        status = "✅ Fully Decoded" if not still_obfuscated else "⚠️ Partially Decoded"
+        
+        # Send result
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
+            tmp.write(decoded_code)
+            tmp_name = tmp.name
+        
+        try:
+            with open(tmp_name, 'rb') as f:
+                await telegram_app.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(f, filename=f"decoded_{filename}"),
+                    caption=(
+                        f"{status}\n\n"
+                        f"📄 {filename}\n"
+                        f"📊 {len(decoded_code):,} chars\n"
+                        f"🔄 {iterations} layers decoded\n\n"
+                        f"{CREDIT}"
+                    ),
+                    parse_mode="HTML"
+                )
+            
+            # Send preview
+            preview = decoded_code[:3800] if len(decoded_code) <= 4000 else decoded_code[:3800] + "\n\n..."
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=f"<b>Preview:</b>\n\n<pre>{preview}</pre>",
+                parse_mode="HTML"
+            )
+            
+            # Delete status message
+            await telegram_app.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+            
+        finally:
+            os.remove(tmp_name)
+        
+        logger.info(f"✅ Completed decode for chat {chat_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Background task error: {e}")
+        logger.error(traceback.format_exc())
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Error during decoding\n\n<code>{str(e)[:300]}</code>",
+                parse_mode="HTML"
+            )
+        except:
+            pass
 
 
 # --- Message Handler ---
 async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming code."""
+    """Handle incoming code - start background processing."""
     code = ""
-    filename_original = "code.py"
-    processing_msg = None
-
+    filename = "code.py"
+    
     try:
         # Extract code
         if update.message.document:
             doc = update.message.document
             
             if not doc.file_name.endswith('.py'):
-                await update.message.reply_text(
-                    "⚠️ Please send a .py file",
-                    parse_mode="HTML"
-                )
+                await update.message.reply_text("⚠️ Send .py file only")
                 return
             
             if doc.file_size > MAX_FILE_SIZE:
                 await update.message.reply_text(
-                    f"⚠️ File too large (max {MAX_FILE_SIZE//(1024*1024)}MB)",
-                    parse_mode="HTML"
+                    f"⚠️ File too large\nMax: {MAX_FILE_SIZE//(1024*1024)}MB"
                 )
                 return
             
-            filename_original = doc.file_name
-            
-            processing_msg = await update.message.reply_text(
-                "📥 <b>Downloading...</b>",
-                parse_mode="HTML"
-            )
-            
+            filename = doc.file_name
             file = await doc.get_file()
             file_bytes = await file.download_as_bytearray()
             code = file_bytes.decode('utf-8', errors='ignore')
@@ -515,148 +541,38 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if len(code) > MAX_CODE_LENGTH:
                 await update.message.reply_text(
-                    f"⚠️ Code too long (max {MAX_CODE_LENGTH:,} chars)",
-                    parse_mode="HTML"
+                    f"⚠️ Code too long\nMax: {MAX_CODE_LENGTH:,} chars"
                 )
                 return
         else:
             return
 
         if not code.strip():
-            await update.message.reply_text("⚠️ Empty code", parse_mode="HTML")
+            await update.message.reply_text("⚠️ Empty code")
             return
 
-        # Initial check
-        if not processing_msg:
-            processing_msg = await update.message.reply_text(
-                "🔬 <b>Analyzing code...</b>",
-                parse_mode="HTML"
-            )
-        else:
-            await processing_msg.edit_text(
-                "🔬 <b>Analyzing code...</b>",
-                parse_mode="HTML"
-            )
-        
-        # Check if already clean
-        if not is_code_obfuscated(code):
-            await processing_msg.edit_text(
-                "✅ <b>Code is already clean!</b>\n\n"
-                "No obfuscation detected. This code is readable as-is.",
-                parse_mode="HTML"
-            )
-            
-            # Still send it back
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
-                tmp.write(code)
-                tmp_name = tmp.name
-            
-            try:
-                with open(tmp_name, 'rb') as f:
-                    await update.message.reply_document(
-                        document=InputFile(f, filename=filename_original),
-                        caption="✅ Already clean (no decoding needed)"
-                    )
-            finally:
-                os.remove(tmp_name)
-            
-            await processing_msg.delete()
-            return
-
-        # Start decoding process
-        await processing_msg.edit_text(
-            "🔧 <b>Decoding...</b>\n"
-            "Starting iterative decoding process...",
+        # Send initial status
+        status_msg = await update.message.reply_text(
+            "🚀 <b>Decoding Started</b>\n\n"
+            "⏳ <b>This may take 1-10 minutes</b>\n\n"
+            "You can:\n"
+            "• Leave this chat\n"
+            "• Use other apps\n"
+            "• Close Telegram\n\n"
+            "I'll send the decoded file automatically when done!\n\n"
+            "<i>Processing in background...</i>",
             parse_mode="HTML"
         )
-
-        # Full decode with iterations
-        success, decoded_code, decode_log = await ensure_fully_decoded(code)
-
-        if not success:
-            error_log = "\n".join(decode_log[-5:])  # Last 5 entries
-            await processing_msg.edit_text(
-                f"❌ <b>Decoding Failed</b>\n\n"
-                f"<b>Log:</b>\n<code>{error_log}</code>\n\n"
-                f"Contact {CREDIT}",
-                parse_mode="HTML"
-            )
-            return
-
-        # Verify final code is clean
-        still_obfuscated = is_code_obfuscated(decoded_code)
         
-        # Prepare log summary
-        log_summary = "\n".join(decode_log)
-        
-        await processing_msg.edit_text(
-            "✅ <b>Decoding Complete!</b>\n📤 Sending results...",
-            parse_mode="HTML"
+        # Start background task
+        chat_id = update.effective_chat.id
+        asyncio.create_task(
+            process_decoding_task(chat_id, code, filename, status_msg.message_id)
         )
-
-        # Send decoded file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
-            tmp.write(decoded_code)
-            tmp_name = tmp.name
-
-        try:
-            status_icon = "✅" if not still_obfuscated else "⚠️"
-            status_text = "Fully Decoded" if not still_obfuscated else "Partially Decoded"
-            
-            with open(tmp_name, 'rb') as f:
-                await update.message.reply_document(
-                    document=InputFile(f, filename=f"decoded_{filename_original}"),
-                    caption=(
-                        f"{status_icon} <b>{status_text}!</b>\n\n"
-                        f"📄 File: {filename_original}\n"
-                        f"📊 Size: {len(decoded_code):,} chars\n"
-                        f"🔄 Iterations: {len([l for l in decode_log if 'Iteration' in l])}\n"
-                        f"🎯 Status: {'Clean' if not still_obfuscated else 'May have remaining obfuscation'}\n\n"
-                        f"{CREDIT}"
-                    ),
-                    parse_mode="HTML"
-                )
-            
-            # Send decode log
-            await update.message.reply_text(
-                f"<b>📋 Decode Log:</b>\n\n<code>{log_summary[:3000]}</code>",
-                parse_mode="HTML"
-            )
-            
-            # Send preview
-            preview_len = min(4000, len(decoded_code))
-            preview = decoded_code[:preview_len]
-            if len(decoded_code) > 4000:
-                preview += "\n\n... (see file for complete code)"
-            
-            await update.message.reply_text(
-                f"<b>📝 Code Preview:</b>\n\n<pre>{preview}</pre>",
-                parse_mode="HTML"
-            )
-            
-            await processing_msg.delete()
-
-        finally:
-            if os.path.exists(tmp_name):
-                os.remove(tmp_name)
-
+        
     except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
-        logger.error(traceback.format_exc())
-        
-        try:
-            if processing_msg:
-                await processing_msg.edit_text(
-                    f"❌ <b>Error</b>\n\n<code>{str(e)[:400]}</code>",
-                    parse_mode="HTML"
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ <b>Error</b>\n\n<code>{str(e)[:400]}</code>",
-                    parse_mode="HTML"
-                )
-        except:
-            await update.message.reply_text("❌ An error occurred")
+        logger.error(f"❌ Handler error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 
 # --- Application Lifespan ---
@@ -665,13 +581,13 @@ async def lifespan(app: FastAPI):
     """Manage bot lifecycle."""
     global telegram_app
     
-    logger.info("🚀 Starting Telegram Bot...")
+    logger.info("🚀 Starting bot...")
     
     telegram_app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .read_timeout(120)
-        .write_timeout(120)
+        .read_timeout(180)
+        .write_timeout(180)
         .connect_timeout(90)
         .pool_timeout(90)
         .build()
@@ -697,7 +613,7 @@ async def lifespan(app: FastAPI):
         drop_pending_updates=True
     )
     
-    logger.info(f"✅ Bot ready with complete decoding!")
+    logger.info(f"✅ Bot ready!")
     
     yield
     
@@ -707,9 +623,9 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI Application ---
 app = FastAPI(
-    title="Python Decoder Bot V3",
-    description="Complete iterative decoder with validation",
-    version="3.0.0",
+    title="Python Decoder Bot",
+    description="Unlimited layer decoder with background processing",
+    version="4.0.0",
     lifespan=lifespan
 )
 
@@ -718,12 +634,10 @@ app = FastAPI(
 async def root():
     return {
         "status": "running",
-        "bot": "Python Decoder Bot V3",
-        "version": "3.0.0",
-        "mode": "Complete Iterative Decoding",
-        "max_iterations": MAX_DECODE_ITERATIONS,
-        "model": MODEL_NAME,
-        "developer": "@aadi_io"
+        "bot": "Python Decoder Bot",
+        "version": "4.0.0",
+        "max_layers": MAX_DECODE_ITERATIONS,
+        "model": MODEL_NAME
     }
 
 
