@@ -41,23 +41,25 @@ if not WEBHOOK_URL:
 # --- Initialize Gemini AI ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Get available model
+# Get available model - prefer faster models for code
 def get_best_model():
-    """Get the best available Gemini model."""
+    """Get the best available Gemini model for code generation."""
     try:
         logger.info("🔍 Searching for available Gemini models...")
         
-        # Try to list models
         available = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
                 available.append(m.name)
                 logger.info(f"  ✓ Found: {m.name}")
         
-        # Preferred models in order
+        # Preferred models - fast and reliable for code
         preferred = [
+            'models/gemini-2.5-flash-lite',
+            'models/gemini-flash-lite-latest',
+            'models/gemini-2.0-flash-lite-preview',
+            'models/gemini-flash-latest',
             'models/gemini-1.5-flash',
-            'models/gemini-1.5-pro', 
             'models/gemini-pro',
         ]
         
@@ -66,7 +68,6 @@ def get_best_model():
                 logger.info(f"✅ Selected: {pref}")
                 return pref
         
-        # Use first available
         if available:
             logger.info(f"✅ Using: {available[0]}")
             return available[0]
@@ -74,7 +75,6 @@ def get_best_model():
     except Exception as e:
         logger.warning(f"⚠️ Could not list models: {e}")
     
-    # Default fallback
     return 'models/gemini-pro'
 
 MODEL_NAME = get_best_model()
@@ -83,8 +83,8 @@ logger.info(f"🤖 Initialized: {MODEL_NAME}")
 
 # --- Constants ---
 CREDIT = "🔧 Dev: @aadi_io"
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-MAX_CODE_LENGTH = 100000  # Increased to 100K characters
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB (reduced for better processing)
+MAX_CODE_LENGTH = 50000  # 50K characters
 
 # --- Global Bot Application ---
 telegram_app: Optional[Application] = None
@@ -104,17 +104,69 @@ def clean_code_response(text: str) -> str:
     if text.endswith("```"):
         text = text[:-3]
     
-    # Remove common prefixes
-    lines = text.split('\n')
-    cleaned_lines = []
-    
-    for line in lines:
-        # Skip explanatory lines
-        if line.strip().startswith('#') and any(word in line.lower() for word in ['here', 'decoded', 'result', 'output']):
-            continue
-        cleaned_lines.append(line)
-    
-    return '\n'.join(cleaned_lines).strip()
+    return text.strip()
+
+
+def get_response_text(response) -> tuple[bool, str]:
+    """Safely extract text from Gemini response."""
+    try:
+        # Check if response has candidates
+        if not response.candidates:
+            return False, "No response candidates generated"
+        
+        # Get first candidate
+        candidate = response.candidates[0]
+        
+        # Check finish reason
+        finish_reason_map = {
+            0: "UNSPECIFIED",
+            1: "STOP",
+            2: "MAX_TOKENS",
+            3: "SAFETY",
+            4: "RECITATION",
+            5: "OTHER"
+        }
+        
+        finish_reason = candidate.finish_reason
+        finish_reason_name = finish_reason_map.get(finish_reason, f"UNKNOWN({finish_reason})")
+        
+        logger.info(f"Response finish_reason: {finish_reason_name}")
+        
+        # Check if stopped naturally (most common successful case)
+        if finish_reason == 1:  # STOP
+            if candidate.content and candidate.content.parts:
+                text = ''.join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+                return True, text
+            return False, "No content in response"
+        
+        # Handle MAX_TOKENS
+        if finish_reason == 2:  # MAX_TOKENS
+            if candidate.content and candidate.content.parts:
+                text = ''.join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+                if text:
+                    logger.warning("Response hit max tokens but got partial result")
+                    return True, text
+            return False, "Response exceeded maximum tokens. Code might be too complex."
+        
+        # Handle SAFETY
+        if finish_reason == 3:  # SAFETY
+            return False, "Response blocked by safety filters. Try with different code."
+        
+        # Handle RECITATION
+        if finish_reason == 4:  # RECITATION
+            return False, "Response blocked due to potential copyright issues."
+        
+        # For other cases, try to get text anyway
+        if candidate.content and candidate.content.parts:
+            text = ''.join(part.text for part in candidate.content.parts if hasattr(part, 'text'))
+            if text:
+                return True, text
+        
+        return False, f"Response incomplete (reason: {finish_reason_name})"
+        
+    except Exception as e:
+        logger.error(f"Error extracting response text: {e}")
+        return False, str(e)
 
 
 async def decode_with_gemini(code: str, attempt: int = 1) -> tuple[bool, str]:
@@ -125,23 +177,19 @@ async def decode_with_gemini(code: str, attempt: int = 1) -> tuple[bool, str]:
     try:
         logger.info(f"🔄 Decoding attempt #{attempt}")
         
-        # Enhanced prompt with specific instructions
-        prompt = f"""You are an expert Python code deobfuscator and reverse engineer.
+        # Truncate code if too long
+        code_to_send = code
+        if len(code) > 30000:
+            code_to_send = code[:30000] + "\n# ... [truncated for processing]"
+            logger.warning(f"Code truncated from {len(code)} to 30000 chars")
+        
+        # Simplified prompt for better results
+        prompt = f"""Deobfuscate this Python code. Return only the clean Python code, no explanations.
 
-Your task: Analyze and decode the following obfuscated/encoded Python code.
+Obfuscated code:
+{code_to_send}
 
-INSTRUCTIONS:
-1. Identify the obfuscation method (base64, exec, eval, marshal, zlib, etc.)
-2. Decode/deobfuscate it completely, layer by layer if needed
-3. Return ONLY the clean, readable Python source code
-4. Do NOT include any explanations, comments, or markdown
-5. Do NOT add your own comments about the decoding process
-6. Just output the pure, executable Python code
-
-OBFUSCATED CODE:
-{code}
-
-DECODED CODE:"""
+Clean code:"""
 
         # Run in executor to avoid blocking
         loop = asyncio.get_event_loop()
@@ -152,29 +200,32 @@ DECODED CODE:"""
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.1,
-                    top_p=0.95,
+                    top_p=0.8,
                     top_k=40,
-                    max_output_tokens=8192,
+                    max_output_tokens=16384,  # Increased token limit
                     candidate_count=1,
                 ),
-                safety_settings=[
-                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                ]
+                safety_settings={
+                    'HARASSMENT': 'BLOCK_NONE',
+                    'HATE_SPEECH': 'BLOCK_NONE',
+                    'SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                    'DANGEROUS_CONTENT': 'BLOCK_NONE',
+                }
             )
         )
         
-        if not response or not response.text:
-            logger.error("❌ Empty response from Gemini")
-            return False, "Empty response from AI"
+        # Safely extract text from response
+        success, result = get_response_text(response)
         
-        decoded = clean_code_response(response.text)
+        if not success:
+            logger.error(f"❌ Failed to get response text: {result}")
+            return False, result
+        
+        decoded = clean_code_response(result)
         
         if len(decoded) < 10:
             logger.error(f"❌ Decoded code too short: {len(decoded)} chars")
-            return False, "Decoded code is too short"
+            return False, "Decoded code is too short or empty"
         
         logger.info(f"✅ Successfully decoded {len(decoded)} characters")
         return True, decoded
@@ -225,14 +276,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3️⃣ Wait 15-45 seconds\n"
         "4️⃣ Receive decoded file\n\n"
         "<b>⚠️ Limits:</b>\n"
-        "• Max file size: 10 MB\n"
-        "• Max code length: 100,000 chars\n"
+        "• Max file size: 5 MB\n"
+        "• Max code length: 50,000 chars\n"
         "• Processing time: 15-45 seconds\n"
         "• Auto retry: 3 attempts\n\n"
         "<b>Tips:</b>\n"
-        "• Ensure code is actually obfuscated\n"
-        "• Larger files take more time\n"
-        "• Check file format (.py only)\n\n"
+        "• Smaller files work better\n"
+        "• Very complex obfuscation may fail\n"
+        "• Try splitting large files\n\n"
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
@@ -245,7 +296,7 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Current Model:</b>\n"
         f"<code>{MODEL_NAME}</code>\n\n"
         f"<b>Status:</b> ✅ Active\n"
-        f"<b>Max Output:</b> 8,192 tokens\n"
+        f"<b>Max Output:</b> 16,384 tokens\n"
         f"<b>Temperature:</b> 0.1 (precise)\n\n"
         f"<i>{CREDIT}</i>"
     )
@@ -279,7 +330,8 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"⚠️ <b>File Too Large</b>\n\n"
                     f"Max size: {MAX_FILE_SIZE // (1024*1024)} MB\n"
-                    f"Your file: {doc.file_size / (1024*1024):.2f} MB",
+                    f"Your file: {doc.file_size / (1024*1024):.2f} MB\n\n"
+                    f"Try splitting the file into smaller parts.",
                     parse_mode="HTML"
                 )
                 return
@@ -366,6 +418,7 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         wait_time = 2 ** attempt
                         await processing_msg.edit_text(
                             f"⚠️ <b>Attempt {attempt} failed</b>\n\n"
+                            f"<i>{result[:100]}</i>\n\n"
                             f"Retrying in {wait_time} seconds...\n"
                             f"(Attempt {attempt + 1}/{max_attempts})",
                             parse_mode="HTML"
@@ -375,7 +428,6 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 last_error = str(e)
                 logger.error(f"❌ Exception on attempt {attempt}: {e}")
-                logger.error(traceback.format_exc())
                 
                 if attempt < max_attempts:
                     await asyncio.sleep(2 ** attempt)
@@ -385,14 +437,14 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not success or not decoded_code:
             await processing_msg.edit_text(
                 f"❌ <b>Decoding Failed</b>\n\n"
-                f"Attempted {max_attempts} times.\n\n"
-                f"<b>Last error:</b>\n<code>{last_error[:300]}</code>\n\n"
-                f"<b>Possible reasons:</b>\n"
-                f"• Code is not actually obfuscated\n"
-                f"• Obfuscation too complex\n"
-                f"• Invalid Python syntax\n"
-                f"• API quota exceeded\n\n"
-                f"Try again or contact {CREDIT}",
+                f"All {max_attempts} attempts failed.\n\n"
+                f"<b>Error:</b>\n<code>{last_error[:400]}</code>\n\n"
+                f"<b>Suggestions:</b>\n"
+                f"• Try a smaller code snippet\n"
+                f"• Check if code is valid Python\n"
+                f"• Ensure code is actually obfuscated\n"
+                f"• Try again in a few minutes\n\n"
+                f"Contact {CREDIT} for support",
                 parse_mode="HTML"
             )
             return
@@ -429,11 +481,11 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
             
-            # Also send as text preview (first 4000 chars)
+            # Also send text preview (first 4000 chars)
             if len(decoded_code) <= 4000:
                 preview = decoded_code
             else:
-                preview = decoded_code[:3900] + "\n\n... (truncated, see file)"
+                preview = decoded_code[:3900] + "\n\n... (see file for complete code)"
             
             await update.message.reply_text(
                 f"<b>📝 Code Preview:</b>\n\n"
@@ -454,17 +506,18 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(traceback.format_exc())
         
         try:
+            error_msg = str(e)[:400]
             if processing_msg:
                 await processing_msg.edit_text(
                     f"❌ <b>Unexpected Error</b>\n\n"
-                    f"<code>{str(e)[:500]}</code>\n\n"
+                    f"<code>{error_msg}</code>\n\n"
                     f"Please try again or contact {CREDIT}",
                     parse_mode="HTML"
                 )
             else:
                 await update.message.reply_text(
                     f"❌ <b>Unexpected Error</b>\n\n"
-                    f"<code>{str(e)[:500]}</code>\n\n"
+                    f"<code>{error_msg}</code>\n\n"
                     f"Please try again or contact {CREDIT}",
                     parse_mode="HTML"
                 )
@@ -486,10 +539,10 @@ async def lifespan(app: FastAPI):
     telegram_app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .read_timeout(60)
-        .write_timeout(60)
-        .connect_timeout(60)
-        .pool_timeout(60)
+        .read_timeout(90)
+        .write_timeout(90)
+        .connect_timeout(90)
+        .pool_timeout(90)
         .build()
     )
     
@@ -531,7 +584,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Python Decoder Bot",
     description="AI-powered Python code deobfuscator",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan
 )
 
@@ -541,7 +594,7 @@ async def root():
     return {
         "status": "✅ running",
         "bot": "Python Decoder Bot",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "model": MODEL_NAME,
         "developer": "@aadi_io"
     }
@@ -549,11 +602,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "model": MODEL_NAME,
-        "timestamp": asyncio.get_event_loop().time()
-    }
+    return {"status": "healthy", "model": MODEL_NAME}
 
 
 @app.post("/webhook")
@@ -565,7 +614,6 @@ async def webhook(request: Request):
         return Response(status_code=200)
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        logger.error(traceback.format_exc())
         return Response(status_code=500)
 
 
