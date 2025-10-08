@@ -1,0 +1,44 @@
+services:
+  # Web Service Configuration
+  - type: web
+    name: python-decoder-bot
+    env: python
+    region: oregon  # Choose your preferred region: oregon, frankfurt, singapore, ohio
+    plan: free  # Options: free, starter, standard, pro
+    
+    # Runtime Configuration
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    
+    # Health Check Configuration
+    healthCheckPath: /health
+    
+    # Auto-Deploy Configuration
+    branch: main  # Change to your default branch if different
+    
+    # Environment Variables
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      
+      - key: PORT
+        value: 10000
+      
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # Set this manually in Render dashboard (it's a secret)
+      
+      - key: GEMINI_API_KEY
+        sync: false  # Set this manually in Render dashboard (it's a secret)
+      
+      - key: WEBHOOK_URL
+        value: https://python-decoder-bot.onrender.com  # Update with your actual Render URL
+    
+    # Scaling Configuration
+    autoDeploy: true
+    
+    # Disk Configuration (if needed for temporary files)
+    disk:
+      name: temp-storage
+      mountPath: /tmp
+      sizeGB: 1
