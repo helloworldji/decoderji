@@ -1,9 +1,10 @@
 import os
 import tempfile
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
-import asyncio
+import traceback
 
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InputFile
@@ -40,306 +41,436 @@ if not WEBHOOK_URL:
 # --- Initialize Gemini AI ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-# List and find available models
-def get_available_model():
+# Get available model
+def get_best_model():
     """Get the best available Gemini model."""
     try:
         logger.info("🔍 Searching for available Gemini models...")
-        available_models = []
         
+        # Try to list models
+        available = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
+                available.append(m.name)
                 logger.info(f"  ✓ Found: {m.name}")
         
         # Preferred models in order
         preferred = [
             'models/gemini-1.5-flash',
-            'models/gemini-1.5-pro',
+            'models/gemini-1.5-pro', 
             'models/gemini-pro',
-            'models/gemini-1.0-pro',
         ]
         
-        # Find first available preferred model
-        for model_name in preferred:
-            if model_name in available_models:
-                logger.info(f"✅ Selected model: {model_name}")
-                return model_name
+        for pref in preferred:
+            if pref in available:
+                logger.info(f"✅ Selected: {pref}")
+                return pref
         
-        # If none of the preferred models, use first available
-        if available_models:
-            logger.info(f"✅ Using first available model: {available_models[0]}")
-            return available_models[0]
-        
-        raise ValueError("No models support generateContent")
-        
+        # Use first available
+        if available:
+            logger.info(f"✅ Using: {available[0]}")
+            return available[0]
+            
     except Exception as e:
-        logger.error(f"❌ Error listing models: {e}")
-        # Fallback to known stable model
-        return 'models/gemini-pro'
+        logger.warning(f"⚠️ Could not list models: {e}")
+    
+    # Default fallback
+    return 'models/gemini-pro'
 
-# Initialize model
-try:
-    MODEL_NAME = get_available_model()
-    model = genai.GenerativeModel(MODEL_NAME)
-    logger.info(f"🤖 Gemini model initialized: {MODEL_NAME}")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize Gemini model: {e}")
-    # Last resort fallback
-    MODEL_NAME = 'models/gemini-pro'
-    model = genai.GenerativeModel(MODEL_NAME)
-    logger.info(f"⚠️ Using fallback model: {MODEL_NAME}")
+MODEL_NAME = get_best_model()
+model = genai.GenerativeModel(MODEL_NAME)
+logger.info(f"🤖 Initialized: {MODEL_NAME}")
 
 # --- Constants ---
 CREDIT = "🔧 Dev: @aadi_io"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-MAX_CODE_LENGTH = 50000  # characters
+MAX_CODE_LENGTH = 100000  # Increased to 100K characters
 
 # --- Global Bot Application ---
 telegram_app: Optional[Application] = None
 
 
+# --- Helper Functions ---
+def clean_code_response(text: str) -> str:
+    """Clean up AI response to get pure Python code."""
+    text = text.strip()
+    
+    # Remove markdown code blocks
+    if text.startswith("```python"):
+        text = text[9:]
+    elif text.startswith("```"):
+        text = text[3:]
+    
+    if text.endswith("```"):
+        text = text[:-3]
+    
+    # Remove common prefixes
+    lines = text.split('\n')
+    cleaned_lines = []
+    
+    for line in lines:
+        # Skip explanatory lines
+        if line.strip().startswith('#') and any(word in line.lower() for word in ['here', 'decoded', 'result', 'output']):
+            continue
+        cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines).strip()
+
+
+async def decode_with_gemini(code: str, attempt: int = 1) -> tuple[bool, str]:
+    """
+    Decode obfuscated code using Gemini AI.
+    Returns: (success: bool, result: str)
+    """
+    try:
+        logger.info(f"🔄 Decoding attempt #{attempt}")
+        
+        # Enhanced prompt with specific instructions
+        prompt = f"""You are an expert Python code deobfuscator and reverse engineer.
+
+Your task: Analyze and decode the following obfuscated/encoded Python code.
+
+INSTRUCTIONS:
+1. Identify the obfuscation method (base64, exec, eval, marshal, zlib, etc.)
+2. Decode/deobfuscate it completely, layer by layer if needed
+3. Return ONLY the clean, readable Python source code
+4. Do NOT include any explanations, comments, or markdown
+5. Do NOT add your own comments about the decoding process
+6. Just output the pure, executable Python code
+
+OBFUSCATED CODE:
+{code}
+
+DECODED CODE:"""
+
+        # Run in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        response = await loop.run_in_executor(
+            None,
+            lambda: model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    top_p=0.95,
+                    top_k=40,
+                    max_output_tokens=8192,
+                    candidate_count=1,
+                ),
+                safety_settings=[
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                ]
+            )
+        )
+        
+        if not response or not response.text:
+            logger.error("❌ Empty response from Gemini")
+            return False, "Empty response from AI"
+        
+        decoded = clean_code_response(response.text)
+        
+        if len(decoded) < 10:
+            logger.error(f"❌ Decoded code too short: {len(decoded)} chars")
+            return False, "Decoded code is too short"
+        
+        logger.info(f"✅ Successfully decoded {len(decoded)} characters")
+        return True, decoded
+        
+    except Exception as e:
+        logger.error(f"❌ Gemini decode error: {e}")
+        logger.error(traceback.format_exc())
+        return False, str(e)
+
+
 # --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message with bot information."""
+    """Welcome message."""
     welcome_text = (
         "🤖 <b>Python Decoder Bot</b>\n\n"
-        "Send me any obfuscated or encoded Python file/code and I'll decode it for you!\n\n"
+        "🔓 Send me obfuscated/encoded Python code and I'll decode it!\n\n"
         "<b>✨ Supported Formats:</b>\n"
-        "• Base64 encoded code\n"
-        "• Exec/eval wrapped code\n"
-        "• Multi-layer obfuscation\n"
-        "• Encrypted strings & payloads\n"
-        "• Marshal/zlib compressed code\n\n"
-        "<b>📤 How to use:</b>\n"
-        "1. Send a .py file (as document)\n"
-        "2. Or paste the code directly as text\n\n"
+        "✅ Base64 encoding\n"
+        "✅ Exec/Eval wrappers\n"
+        "✅ Marshal serialization\n"
+        "✅ Zlib compression\n"
+        "✅ Multi-layer obfuscation\n"
+        "✅ String encryption\n\n"
+        "<b>📤 Usage:</b>\n"
+        "• Send .py file as document\n"
+        "• Or paste code as text message\n\n"
         "<b>⚡ Features:</b>\n"
         "• AI-powered decoding\n"
-        "• Clean, readable output\n"
-        "• Instant processing\n\n"
+        "• Automatic retry (3 attempts)\n"
+        "• Clean, formatted output\n"
+        "• Fast processing (~15-45 sec)\n\n"
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Provides help information."""
+    """Help information."""
     help_text = (
         "<b>📖 Help Guide</b>\n\n"
         "<b>Commands:</b>\n"
-        "/start - Start the bot\n"
-        "/help - Show this help message\n"
-        "/models - Show current AI model info\n\n"
-        "<b>Usage:</b>\n"
-        "Simply send me a Python file or paste obfuscated code.\n\n"
-        "<b>⚠️ Limitations:</b>\n"
-        "• Max file size: 10MB\n"
-        "• Max code length: 50,000 characters\n"
-        "• Processing time: ~10-30 seconds\n\n"
+        "/start - Welcome message\n"
+        "/help - This help guide\n"
+        "/model - Show current AI model\n\n"
+        "<b>How to Use:</b>\n"
+        "1️⃣ Send your obfuscated .py file\n"
+        "2️⃣ Or paste the code directly\n"
+        "3️⃣ Wait 15-45 seconds\n"
+        "4️⃣ Receive decoded file\n\n"
+        "<b>⚠️ Limits:</b>\n"
+        "• Max file size: 10 MB\n"
+        "• Max code length: 100,000 chars\n"
+        "• Processing time: 15-45 seconds\n"
+        "• Auto retry: 3 attempts\n\n"
+        "<b>Tips:</b>\n"
+        "• Ensure code is actually obfuscated\n"
+        "• Larger files take more time\n"
+        "• Check file format (.py only)\n\n"
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
 
 
-async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current model information."""
-    model_info = (
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show model info."""
+    info_text = (
         f"<b>🤖 AI Model Information</b>\n\n"
         f"<b>Current Model:</b>\n"
         f"<code>{MODEL_NAME}</code>\n\n"
-        f"<b>Status:</b> ✅ Active\n\n"
+        f"<b>Status:</b> ✅ Active\n"
+        f"<b>Max Output:</b> 8,192 tokens\n"
+        f"<b>Temperature:</b> 0.1 (precise)\n\n"
         f"<i>{CREDIT}</i>"
     )
-    await update.message.reply_text(model_info, parse_mode="HTML")
+    await update.message.reply_text(info_text, parse_mode="HTML")
 
 
 # --- Message Handler ---
 async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles incoming Python files or code snippets for decoding."""
+    """Handle incoming code for decoding."""
     code = ""
     filename_original = "code.py"
+    processing_msg = None
 
     try:
-        # Handle document (file)
+        # === STEP 1: Extract Code ===
         if update.message.document:
             doc = update.message.document
             
             # Validate file type
             if not doc.file_name.endswith('.py'):
                 await update.message.reply_text(
-                    "⚠️ Please send a Python file (.py) or paste code as text."
+                    "⚠️ <b>Invalid File Type</b>\n\n"
+                    "Please send a Python file (.py)\n"
+                    "or paste code as text.",
+                    parse_mode="HTML"
                 )
                 return
             
             # Validate file size
             if doc.file_size > MAX_FILE_SIZE:
                 await update.message.reply_text(
-                    f"⚠️ File too large! Max size: {MAX_FILE_SIZE // (1024*1024)}MB"
+                    f"⚠️ <b>File Too Large</b>\n\n"
+                    f"Max size: {MAX_FILE_SIZE // (1024*1024)} MB\n"
+                    f"Your file: {doc.file_size / (1024*1024):.2f} MB",
+                    parse_mode="HTML"
                 )
                 return
             
             filename_original = doc.file_name
             
-            # Download and read file
+            # Download file
+            processing_msg = await update.message.reply_text(
+                "📥 <b>Downloading file...</b>",
+                parse_mode="HTML"
+            )
+            
             file = await doc.get_file()
             file_bytes = await file.download_as_bytearray()
             code = file_bytes.decode('utf-8', errors='ignore')
             
-        # Handle text message
         elif update.message.text:
             code = update.message.text
             
-            # Validate code length
+            # Validate length
             if len(code) > MAX_CODE_LENGTH:
                 await update.message.reply_text(
-                    f"⚠️ Code too long! Max length: {MAX_CODE_LENGTH} characters"
+                    f"⚠️ <b>Code Too Long</b>\n\n"
+                    f"Max length: {MAX_CODE_LENGTH:,} characters\n"
+                    f"Your code: {len(code):,} characters",
+                    parse_mode="HTML"
                 )
                 return
         else:
             return
 
-        # Check if code is empty
+        # Check if empty
         if not code.strip():
-            await update.message.reply_text("⚠️ Empty code received. Please send valid Python code.")
+            await update.message.reply_text(
+                "⚠️ <b>Empty Code</b>\n\n"
+                "Please send valid Python code.",
+                parse_mode="HTML"
+            )
             return
 
-        # Send processing message
-        processing_msg = await update.message.reply_text(
-            "🔄 Decoding your code...\n⏳ This may take 10-30 seconds."
-        )
+        # === STEP 2: Process Code ===
+        if not processing_msg:
+            processing_msg = await update.message.reply_text(
+                "🔄 <b>Processing...</b>\n"
+                "⏳ Decoding your code (attempt 1/3)",
+                parse_mode="HTML"
+            )
+        else:
+            await processing_msg.edit_text(
+                "🔄 <b>Processing...</b>\n"
+                "⏳ Decoding your code (attempt 1/3)",
+                parse_mode="HTML"
+            )
 
-        # Prepare prompt for Gemini
-        prompt = (
-            "You are a Python code deobfuscator. Analyze the following obfuscated/encoded Python code "
-            "and return ONLY the clean, deobfuscated, readable Python code. "
-            "Do not include any explanations, markdown formatting, or comments about the process. "
-            "Just output the pure Python code.\n\n"
-            "If the code uses base64, exec, eval, marshal, zlib, or any other obfuscation technique, "
-            "decode it completely and return the original source code.\n\n"
-            f"Code to decode:\n\n{code}"
-        )
-
-        # Call Gemini AI with proper error handling
+        # === STEP 3: Decode with Retry Logic ===
+        max_attempts = 3
+        success = False
         decoded_code = None
-        max_retries = 3
-        
-        for attempt in range(max_retries):
+        last_error = ""
+
+        for attempt in range(1, max_attempts + 1):
             try:
-                logger.info(f"🔄 Attempt {attempt + 1}/{max_retries} to decode code...")
-                
-                # Generate content with configuration
-                response = model.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.1,
-                        top_p=0.95,
-                        top_k=40,
-                        max_output_tokens=8192,
-                    ),
-                    safety_settings=[
-                        {
-                            "category": "HARM_CATEGORY_HARASSMENT",
-                            "threshold": "BLOCK_NONE",
-                        },
-                        {
-                            "category": "HARM_CATEGORY_HATE_SPEECH",
-                            "threshold": "BLOCK_NONE",
-                        },
-                        {
-                            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                            "threshold": "BLOCK_NONE",
-                        },
-                        {
-                            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                            "threshold": "BLOCK_NONE",
-                        },
-                    ]
+                # Update status
+                await processing_msg.edit_text(
+                    f"🔄 <b>Processing...</b>\n"
+                    f"⏳ Decoding attempt {attempt}/{max_attempts}\n"
+                    f"📊 Code size: {len(code):,} chars",
+                    parse_mode="HTML"
                 )
                 
-                decoded_code = response.text.strip()
-                logger.info("✅ Successfully decoded code")
-                break
+                # Attempt decode
+                success, result = await decode_with_gemini(code, attempt)
+                
+                if success:
+                    decoded_code = result
+                    logger.info(f"✅ Decode successful on attempt {attempt}")
+                    break
+                else:
+                    last_error = result
+                    logger.warning(f"⚠️ Attempt {attempt} failed: {result}")
+                    
+                    if attempt < max_attempts:
+                        # Wait before retry with exponential backoff
+                        wait_time = 2 ** attempt
+                        await processing_msg.edit_text(
+                            f"⚠️ <b>Attempt {attempt} failed</b>\n\n"
+                            f"Retrying in {wait_time} seconds...\n"
+                            f"(Attempt {attempt + 1}/{max_attempts})",
+                            parse_mode="HTML"
+                        )
+                        await asyncio.sleep(wait_time)
                 
             except Exception as e:
-                logger.error(f"❌ Gemini API error (attempt {attempt + 1}/{max_retries}): {e}")
+                last_error = str(e)
+                logger.error(f"❌ Exception on attempt {attempt}: {e}")
+                logger.error(traceback.format_exc())
                 
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                else:
-                    error_msg = str(e)
-                    await processing_msg.edit_text(
-                        "❌ Failed to decode the code.\n\n"
-                        f"<b>Error:</b> <code>{error_msg[:200]}</code>\n\n"
-                        "Possible solutions:\n"
-                        "• Try with smaller code snippet\n"
-                        "• Check if code is actually obfuscated\n"
-                        "• Try again in a few moments\n\n"
-                        f"If issue persists, contact {CREDIT}",
-                        parse_mode="HTML"
-                    )
-                    return
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 ** attempt)
+                continue
 
-        # Validate decoded output
-        if not decoded_code:
+        # === STEP 4: Handle Result ===
+        if not success or not decoded_code:
             await processing_msg.edit_text(
-                "⚠️ No response from AI. Please try again."
+                f"❌ <b>Decoding Failed</b>\n\n"
+                f"Attempted {max_attempts} times.\n\n"
+                f"<b>Last error:</b>\n<code>{last_error[:300]}</code>\n\n"
+                f"<b>Possible reasons:</b>\n"
+                f"• Code is not actually obfuscated\n"
+                f"• Obfuscation too complex\n"
+                f"• Invalid Python syntax\n"
+                f"• API quota exceeded\n\n"
+                f"Try again or contact {CREDIT}",
+                parse_mode="HTML"
             )
             return
 
-        # Clean up markdown code blocks if present
-        if decoded_code.startswith("```python"):
-            decoded_code = decoded_code[9:]
-        elif decoded_code.startswith("```"):
-            decoded_code = decoded_code[3:]
-        if decoded_code.endswith("```"):
-            decoded_code = decoded_code[:-3]
-        
-        decoded_code = decoded_code.strip()
+        # === STEP 5: Send Decoded File ===
+        await processing_msg.edit_text(
+            "✅ <b>Decoding Complete!</b>\n"
+            "📤 Preparing file...",
+            parse_mode="HTML"
+        )
 
-        if len(decoded_code) < 10:
-            await processing_msg.edit_text(
-                "⚠️ Decoding failed. The code might be too complex or not actually obfuscated."
-            )
-            return
-
-        # Create temporary file for decoded code
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp_file:
+        # Create temp file
+        with tempfile.NamedTemporaryFile(
+            mode='w', 
+            suffix='.py', 
+            delete=False, 
+            encoding='utf-8'
+        ) as tmp_file:
             tmp_file.write(decoded_code)
             tmp_filename = tmp_file.name
 
         try:
-            # Send decoded file
+            # Send file
             with open(tmp_filename, 'rb') as f:
                 await update.message.reply_document(
                     document=InputFile(f, filename=f"decoded_{filename_original}"),
-                    caption=f"✅ <b>Decoding Complete!</b>\n\n"
-                            f"<b>Model used:</b> <code>{MODEL_NAME.split('/')[-1]}</code>\n\n"
-                            f"{CREDIT}",
+                    caption=(
+                        f"✅ <b>Successfully Decoded!</b>\n\n"
+                        f"📄 <b>Original:</b> {filename_original}\n"
+                        f"📊 <b>Size:</b> {len(decoded_code):,} chars\n"
+                        f"🤖 <b>Model:</b> {MODEL_NAME.split('/')[-1]}\n\n"
+                        f"{CREDIT}"
+                    ),
                     parse_mode="HTML"
                 )
+            
+            # Also send as text preview (first 4000 chars)
+            if len(decoded_code) <= 4000:
+                preview = decoded_code
+            else:
+                preview = decoded_code[:3900] + "\n\n... (truncated, see file)"
+            
+            await update.message.reply_text(
+                f"<b>📝 Code Preview:</b>\n\n"
+                f"<pre>{preview}</pre>",
+                parse_mode="HTML"
+            )
             
             # Delete processing message
             await processing_msg.delete()
 
         finally:
-            # Clean up temporary file
+            # Cleanup
             if os.path.exists(tmp_filename):
                 os.remove(tmp_filename)
 
     except Exception as e:
-        logger.error(f"Error in handle_code_input: {e}", exc_info=True)
+        logger.error(f"❌ Fatal error in handle_code_input: {e}")
+        logger.error(traceback.format_exc())
+        
         try:
-            await update.message.reply_text(
-                f"❌ An unexpected error occurred.\n\n"
-                f"<b>Error:</b> <code>{str(e)[:200]}</code>\n\n"
-                f"Please try again or contact {CREDIT}",
-                parse_mode="HTML"
-            )
+            if processing_msg:
+                await processing_msg.edit_text(
+                    f"❌ <b>Unexpected Error</b>\n\n"
+                    f"<code>{str(e)[:500]}</code>\n\n"
+                    f"Please try again or contact {CREDIT}",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ <b>Unexpected Error</b>\n\n"
+                    f"<code>{str(e)[:500]}</code>\n\n"
+                    f"Please try again or contact {CREDIT}",
+                    parse_mode="HTML"
+                )
         except:
             await update.message.reply_text(
-                "❌ An unexpected error occurred. Please try again or contact support."
+                "❌ An unexpected error occurred. Please try again."
             )
 
 
@@ -352,21 +483,20 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Starting Telegram Bot...")
     
-    # Initialize telegram application
     telegram_app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .read_timeout(30)
-        .write_timeout(30)
-        .connect_timeout(30)
-        .pool_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(60)
+        .pool_timeout(60)
         .build()
     )
     
     # Register handlers
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("help", help_command))
-    telegram_app.add_handler(CommandHandler("models", models_command))
+    telegram_app.add_handler(CommandHandler("model", model_command))
     telegram_app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.PY) & ~filters.COMMAND,
@@ -374,7 +504,6 @@ async def lifespan(app: FastAPI):
         )
     )
     
-    # Initialize the application
     await telegram_app.initialize()
     await telegram_app.start()
     
@@ -386,13 +515,14 @@ async def lifespan(app: FastAPI):
         drop_pending_updates=True
     )
     
-    logger.info(f"✅ Webhook set to: {webhook_url}")
-    logger.info(f"✅ Bot is ready with model: {MODEL_NAME}")
+    logger.info(f"✅ Webhook: {webhook_url}")
+    logger.info(f"✅ Model: {MODEL_NAME}")
+    logger.info("✅ Bot ready!")
     
     yield
     
     # Shutdown
-    logger.info("🛑 Shutting down bot...")
+    logger.info("🛑 Shutting down...")
     await telegram_app.stop()
     await telegram_app.shutdown()
 
@@ -400,19 +530,18 @@ async def lifespan(app: FastAPI):
 # --- FastAPI Application ---
 app = FastAPI(
     title="Python Decoder Bot",
-    description="Telegram bot for decoding obfuscated Python code",
-    version="2.1.0",
+    description="AI-powered Python code deobfuscator",
+    version="3.0.0",
     lifespan=lifespan
 )
 
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
     return {
-        "status": "running",
+        "status": "✅ running",
         "bot": "Python Decoder Bot",
-        "version": "2.1.0",
+        "version": "3.0.0",
         "model": MODEL_NAME,
         "developer": "@aadi_io"
     }
@@ -420,45 +549,32 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check for monitoring."""
     return {
         "status": "healthy",
-        "model": MODEL_NAME
+        "model": MODEL_NAME,
+        "timestamp": asyncio.get_event_loop().time()
     }
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Webhook endpoint for receiving Telegram updates."""
     try:
-        # Parse incoming update
         json_data = await request.json()
         update = Update.de_json(json_data, telegram_app.bot)
-        
-        # Process update
         await telegram_app.process_update(update)
-        
         return Response(status_code=200)
-    
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}", exc_info=True)
+        logger.error(f"Webhook error: {e}")
+        logger.error(traceback.format_exc())
         return Response(status_code=500)
 
 
 @app.head("/")
 @app.head("/health")
 async def head_health():
-    """HEAD request for health checks."""
     return Response(status_code=200)
 
 
-# --- Main Entry Point ---
 if __name__ == "__main__":
     import uvicorn
-    
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
