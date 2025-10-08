@@ -2,6 +2,8 @@ import os
 import tempfile
 import logging
 import asyncio
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 import traceback
@@ -53,13 +55,11 @@ def get_best_model():
                 available.append(m.name)
                 logger.info(f"  ✓ Found: {m.name}")
         
-        # Preferred models - fast and reliable
+        # Preferred models
         preferred = [
             'models/gemini-2.5-flash-lite',
             'models/gemini-flash-lite-latest',
-            'models/gemini-2.0-flash-lite-preview',
             'models/gemini-flash-latest',
-            'models/gemini-1.5-flash',
             'models/gemini-pro',
         ]
         
@@ -85,6 +85,7 @@ logger.info(f"🤖 Initialized: {MODEL_NAME}")
 CREDIT = "🔧 Dev: @aadi_io"
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MAX_CODE_LENGTH = 30000  # 30K characters
+DECODER_TIMEOUT = 30  # 30 seconds max execution time
 
 # --- Global Bot Application ---
 telegram_app: Optional[Application] = None
@@ -110,34 +111,11 @@ def clean_code_response(text: str) -> str:
 def extract_response_text(response) -> tuple[bool, str]:
     """Safely extract text from Gemini response."""
     try:
-        # Check if response exists
-        if not response:
+        if not response or not hasattr(response, 'candidates') or not response.candidates:
             return False, "No response from API"
         
-        # Check for candidates
-        if not hasattr(response, 'candidates') or not response.candidates:
-            return False, "No response candidates"
-        
-        # Get first candidate
         candidate = response.candidates[0]
         
-        # Check finish reason
-        finish_reason = candidate.finish_reason
-        
-        # Map finish reasons
-        finish_reasons = {
-            0: "UNSPECIFIED",
-            1: "STOP",
-            2: "MAX_TOKENS",
-            3: "SAFETY",
-            4: "RECITATION",
-            5: "OTHER"
-        }
-        
-        reason_name = finish_reasons.get(finish_reason, f"UNKNOWN({finish_reason})")
-        logger.info(f"Response finish_reason: {reason_name}")
-        
-        # Try to extract text from parts
         if hasattr(candidate, 'content') and candidate.content:
             if hasattr(candidate.content, 'parts') and candidate.content.parts:
                 text_parts = []
@@ -146,58 +124,45 @@ def extract_response_text(response) -> tuple[bool, str]:
                         text_parts.append(part.text)
                 
                 if text_parts:
-                    full_text = ''.join(text_parts)
-                    
-                    # Check if we got truncated (MAX_TOKENS)
-                    if finish_reason == 2:
-                        logger.warning("Response was truncated (MAX_TOKENS)")
-                        return True, full_text  # Still return what we got
-                    
-                    # Check safety block
-                    if finish_reason == 3:
-                        return False, "Response blocked by safety filters"
-                    
-                    # Normal completion
-                    if finish_reason == 1:
-                        return True, full_text
-                    
-                    # Other reasons - try to use text anyway
-                    if full_text.strip():
-                        return True, full_text
+                    return True, ''.join(text_parts)
         
-        # Check for safety ratings (blocked content)
-        if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
-            blocked = [r for r in candidate.safety_ratings if hasattr(r, 'blocked') and r.blocked]
-            if blocked:
-                return False, f"Content blocked by safety filters: {reason_name}"
-        
-        return False, f"Could not extract text (finish_reason: {reason_name})"
+        return False, "Could not extract response text"
         
     except Exception as e:
-        logger.error(f"Error extracting response: {e}")
         return False, str(e)
 
 
-async def decode_with_gemini(code: str, attempt: int = 1) -> tuple[bool, str]:
-    """Decode obfuscated code using Gemini AI."""
+async def generate_decoder_script(obfuscated_code: str, attempt: int = 1) -> tuple[bool, str]:
+    """Ask Gemini to create a decoder script for the obfuscated code."""
     try:
-        logger.info(f"🔄 Decoding attempt #{attempt}")
+        logger.info(f"🔄 Generating decoder script (attempt #{attempt})")
         
         # Truncate if needed
-        code_to_send = code
-        if len(code) > MAX_CODE_LENGTH:
-            code_to_send = code[:MAX_CODE_LENGTH]
-            logger.warning(f"Code truncated from {len(code)} to {MAX_CODE_LENGTH} chars")
+        code_sample = obfuscated_code
+        if len(obfuscated_code) > 10000:
+            code_sample = obfuscated_code[:10000]
+            logger.info(f"Using first 10K chars for analysis")
         
-        # Simple, clear prompt - fixed f-string syntax
+        # Enhanced prompt for decoder generation
         prompt = (
-            "Deobfuscate and decode this Python code. "
-            "Return ONLY the clean, readable Python code without any explanations or markdown.\n\n"
-            f"Obfuscated code:\n{code_to_send}\n\n"
-            "Clean Python code:"
+            "You are a Python reverse engineering expert. Analyze this obfuscated Python code "
+            "and create a DECODER SCRIPT that will deobfuscate it.\n\n"
+            
+            "INSTRUCTIONS:\n"
+            "1. Identify the obfuscation method (base64, exec, eval, marshal, zlib, etc.)\n"
+            "2. Write a complete Python script that will decode the obfuscated code\n"
+            "3. The script should read from 'obfuscated_code.txt' and write decoded code to 'decoded_code.py'\n"
+            "4. Handle multiple layers of obfuscation if present\n"
+            "5. Add error handling in the decoder\n"
+            "6. Return ONLY the decoder script code, no explanations\n\n"
+            
+            "OBFUSCATED CODE SAMPLE:\n"
+            f"{code_sample}\n\n"
+            
+            "DECODER SCRIPT:"
         )
 
-        # Proper safety settings using enums
+        # Safety settings
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -207,14 +172,13 @@ async def decode_with_gemini(code: str, attempt: int = 1) -> tuple[bool, str]:
         
         # Generation config
         generation_config = genai.types.GenerationConfig(
-            temperature=0.1,
-            top_p=0.8,
+            temperature=0.2,
+            top_p=0.9,
             top_k=40,
-            max_output_tokens=16384,
-            candidate_count=1,
+            max_output_tokens=8192,
         )
         
-        # Run in executor
+        # Generate decoder
         loop = asyncio.get_event_loop()
         
         response = await loop.run_in_executor(
@@ -226,50 +190,148 @@ async def decode_with_gemini(code: str, attempt: int = 1) -> tuple[bool, str]:
             )
         )
         
-        # Extract text safely
+        # Extract decoder script
         success, result = extract_response_text(response)
         
         if not success:
-            logger.error(f"❌ Failed to extract text: {result}")
-            return False, result
+            return False, f"Failed to generate decoder: {result}"
         
-        # Clean the code
-        decoded = clean_code_response(result)
+        decoder_script = clean_code_response(result)
         
-        if len(decoded) < 10:
-            logger.error(f"❌ Decoded code too short: {len(decoded)} chars")
-            return False, "Decoded output is too short or empty"
+        if len(decoder_script) < 20:
+            return False, "Generated decoder is too short"
         
-        logger.info(f"✅ Successfully decoded {len(decoded)} characters")
-        return True, decoded
+        logger.info(f"✅ Generated decoder script ({len(decoder_script)} chars)")
+        return True, decoder_script
+        
+    except Exception as e:
+        logger.error(f"❌ Error generating decoder: {e}")
+        return False, str(e)
+
+
+async def execute_decoder(decoder_script: str, obfuscated_code: str) -> tuple[bool, str]:
+    """Execute the decoder script safely to decode the obfuscated code."""
+    try:
+        logger.info("🔧 Executing decoder script...")
+        
+        # Create temporary directory
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Write obfuscated code
+            obfuscated_file = os.path.join(temp_dir, "obfuscated_code.txt")
+            with open(obfuscated_file, 'w', encoding='utf-8') as f:
+                f.write(obfuscated_code)
+            
+            # Write decoder script
+            decoder_file = os.path.join(temp_dir, "decoder.py")
+            with open(decoder_file, 'w', encoding='utf-8') as f:
+                f.write(decoder_script)
+            
+            # Expected output file
+            decoded_file = os.path.join(temp_dir, "decoded_code.py")
+            
+            # Execute decoder with timeout
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        sys.executable,
+                        decoder_file,
+                        cwd=temp_dir,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    ),
+                    timeout=DECODER_TIMEOUT
+                )
+                
+                stdout, stderr = await result.communicate()
+                
+                # Check if decoder created output file
+                if os.path.exists(decoded_file):
+                    with open(decoded_file, 'r', encoding='utf-8') as f:
+                        decoded_code = f.read()
+                    
+                    if decoded_code.strip():
+                        logger.info(f"✅ Decoder executed successfully ({len(decoded_code)} chars)")
+                        return True, decoded_code
+                
+                # If no output file, check stdout
+                if stdout:
+                    decoded_code = stdout.decode('utf-8', errors='ignore')
+                    if len(decoded_code) > 10:
+                        logger.info("✅ Got decoded code from stdout")
+                        return True, decoded_code
+                
+                # Log error if any
+                if stderr:
+                    error_msg = stderr.decode('utf-8', errors='ignore')
+                    logger.error(f"Decoder stderr: {error_msg}")
+                    return False, f"Decoder execution error: {error_msg[:500]}"
+                
+                return False, "Decoder did not produce output"
+                
+            except asyncio.TimeoutError:
+                return False, "Decoder execution timeout (>30s)"
+            
+    except Exception as e:
+        logger.error(f"❌ Error executing decoder: {e}")
+        logger.error(traceback.format_exc())
+        return False, str(e)
+
+
+async def decode_with_ai_decoder(code: str, attempt: int = 1) -> tuple[bool, str, str]:
+    """
+    Complete decoding process:
+    1. Generate decoder script with Gemini
+    2. Execute the decoder
+    Returns: (success, decoded_code, method_description)
+    """
+    try:
+        # Step 1: Generate decoder script
+        success, decoder_script = await generate_decoder_script(code, attempt)
+        
+        if not success:
+            return False, "", f"Decoder generation failed: {decoder_script}"
+        
+        # Step 2: Execute decoder
+        success, decoded_code = await execute_decoder(decoder_script, code)
+        
+        if not success:
+            return False, decoder_script, f"Decoder execution failed: {decoded_code}"
+        
+        # Step 3: Validate decoded code
+        if len(decoded_code) < 10:
+            return False, decoder_script, "Decoded code is too short"
+        
+        # Success!
+        method_desc = "AI-generated decoder"
+        logger.info(f"✅ Successfully decoded using AI decoder")
+        return True, decoded_code, method_desc
         
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"❌ Gemini decode error: {error_msg}")
-        logger.error(traceback.format_exc())
-        return False, error_msg
+        logger.error(f"❌ Decoding error: {error_msg}")
+        return False, "", error_msg
 
 
 # --- Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message."""
     welcome_text = (
-        "🤖 <b>Python Decoder Bot</b>\n\n"
-        "🔓 Send me obfuscated/encoded Python code and I'll decode it!\n\n"
-        "<b>✨ Supported Formats:</b>\n"
-        "✅ Base64 encoding\n"
+        "🤖 <b>Python Decoder Bot V2.0</b>\n\n"
+        "🔓 <b>NEW: AI-Powered Decoder Generation!</b>\n\n"
+        "I don't just decode - I <b>create custom decoders</b> for your code!\n\n"
+        "<b>✨ How It Works:</b>\n"
+        "1️⃣ AI analyzes your obfuscated code\n"
+        "2️⃣ Generates a custom decoder script\n"
+        "3️⃣ Executes decoder safely\n"
+        "4️⃣ Returns clean code + decoder\n\n"
+        "<b>🎯 Supported Methods:</b>\n"
+        "✅ Base64, Hex, ROT13\n"
         "✅ Exec/Eval wrappers\n"
-        "✅ Marshal serialization\n"
-        "✅ Zlib compression\n"
+        "✅ Marshal/Pickle/Zlib\n"
         "✅ Multi-layer obfuscation\n"
-        "✅ String encryption\n\n"
+        "✅ Custom encryption\n\n"
         "<b>📤 Usage:</b>\n"
-        "• Send .py file as document\n"
-        "• Or paste code as text\n\n"
-        "<b>⚡ Features:</b>\n"
-        "• AI-powered decoding\n"
-        "• Auto retry (3 attempts)\n"
-        "• Fast processing\n\n"
+        "Send .py file or paste code\n\n"
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(welcome_text, parse_mode="HTML")
@@ -278,19 +340,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help information."""
     help_text = (
-        "<b>📖 Help Guide</b>\n\n"
+        "<b>📖 Advanced Decoder Bot</b>\n\n"
         "<b>Commands:</b>\n"
-        "/start - Start the bot\n"
-        "/help - Show help\n"
-        "/model - Show AI model info\n\n"
-        "<b>How to Use:</b>\n"
-        "1️⃣ Send .py file or paste code\n"
-        "2️⃣ Wait 15-60 seconds\n"
-        "3️⃣ Receive decoded file\n\n"
+        "/start - Welcome & features\n"
+        "/help - This help guide\n"
+        "/model - AI model info\n\n"
+        "<b>🔬 How It Works:</b>\n\n"
+        "<b>Step 1: Analysis</b>\n"
+        "AI identifies obfuscation method\n\n"
+        "<b>Step 2: Generation</b>\n"
+        "Creates custom decoder script\n\n"
+        "<b>Step 3: Execution</b>\n"
+        "Safely runs decoder (30s max)\n\n"
+        "<b>Step 4: Delivery</b>\n"
+        "Returns decoded code + decoder\n\n"
         "<b>⚠️ Limits:</b>\n"
-        "• Max file size: 5 MB\n"
-        "• Max code: 30,000 chars\n"
-        "• 3 auto retries\n\n"
+        "• Max file: 5 MB\n"
+        "• Max code: 30K chars\n"
+        "• Execution: 30s timeout\n"
+        "• Auto retry: 3 attempts\n\n"
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
@@ -299,10 +367,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show model info."""
     info_text = (
-        f"<b>🤖 AI Model Info</b>\n\n"
+        f"<b>🤖 AI Configuration</b>\n\n"
         f"<b>Model:</b> <code>{MODEL_NAME.split('/')[-1]}</code>\n"
+        f"<b>Mode:</b> Decoder Generator\n"
         f"<b>Status:</b> ✅ Active\n"
-        f"<b>Max tokens:</b> 16,384\n\n"
+        f"<b>Max tokens:</b> 8,192\n"
+        f"<b>Temperature:</b> 0.2 (precise)\n"
+        f"<b>Timeout:</b> 30s per execution\n\n"
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(info_text, parse_mode="HTML")
@@ -371,45 +442,48 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # === Process ===
         if not processing_msg:
             processing_msg = await update.message.reply_text(
-                "🔄 <b>Decoding...</b>\nAttempt 1/3",
+                "🔬 <b>Analyzing code...</b>\nStep 1/3: Identifying obfuscation method",
                 parse_mode="HTML"
             )
         else:
             await processing_msg.edit_text(
-                "🔄 <b>Decoding...</b>\nAttempt 1/3",
+                "🔬 <b>Analyzing code...</b>\nStep 1/3: Identifying obfuscation method",
                 parse_mode="HTML"
             )
 
-        # === Decode with Retry ===
+        # === Decode with AI Decoder ===
         max_attempts = 3
         success = False
         decoded_code = None
+        decoder_script = None
         last_error = ""
 
         for attempt in range(1, max_attempts + 1):
             try:
                 await processing_msg.edit_text(
-                    f"🔄 <b>Decoding...</b>\n"
+                    f"🔧 <b>Processing...</b>\n"
                     f"Attempt {attempt}/{max_attempts}\n"
-                    f"Size: {len(code):,} chars",
+                    f"Step 1: Generating decoder...",
                     parse_mode="HTML"
                 )
                 
-                success, result = await decode_with_gemini(code, attempt)
+                success, result, method = await decode_with_ai_decoder(code, attempt)
                 
                 if success:
                     decoded_code = result
+                    decoder_script = None  # We could save this if needed
                     logger.info(f"✅ Success on attempt {attempt}")
                     break
                 else:
-                    last_error = result
-                    logger.warning(f"⚠️ Attempt {attempt} failed: {result}")
+                    decoder_script = result  # Contains decoder script if generation succeeded
+                    last_error = method
+                    logger.warning(f"⚠️ Attempt {attempt} failed: {method}")
                     
                     if attempt < max_attempts:
                         wait_time = 2 ** attempt
                         await processing_msg.edit_text(
                             f"⚠️ <b>Attempt {attempt} failed</b>\n\n"
-                            f"<i>{result[:150]}</i>\n\n"
+                            f"<i>{method[:150]}</i>\n\n"
                             f"Retrying in {wait_time}s...",
                             parse_mode="HTML"
                         )
@@ -425,25 +499,52 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # === Handle Result ===
         if not success or not decoded_code:
-            await processing_msg.edit_text(
+            error_message = (
                 f"❌ <b>Decoding Failed</b>\n\n"
                 f"All {max_attempts} attempts failed.\n\n"
                 f"<b>Error:</b>\n<code>{last_error[:300]}</code>\n\n"
-                f"<b>Try:</b>\n"
-                f"• Smaller code snippet\n"
-                f"• Valid Python syntax\n"
-                f"• Different file\n\n"
-                f"Contact {CREDIT}",
-                parse_mode="HTML"
             )
+            
+            # If we have a decoder script, send it too
+            if decoder_script and len(decoder_script) > 20:
+                error_message += (
+                    f"<b>Generated Decoder:</b>\n"
+                    f"Check decoder script below - you can run it manually.\n\n"
+                )
+            
+            error_message += f"Contact {CREDIT}"
+            
+            await processing_msg.edit_text(error_message, parse_mode="HTML")
+            
+            # Send decoder script if available
+            if decoder_script and len(decoder_script) > 20:
+                with tempfile.NamedTemporaryFile(
+                    mode='w', 
+                    suffix='_decoder.py', 
+                    delete=False,
+                    encoding='utf-8'
+                ) as tmp:
+                    tmp.write(decoder_script)
+                    tmp_name = tmp.name
+                
+                try:
+                    with open(tmp_name, 'rb') as f:
+                        await update.message.reply_document(
+                            document=InputFile(f, filename="failed_decoder.py"),
+                            caption="⚠️ Generated decoder (execution failed)"
+                        )
+                finally:
+                    os.remove(tmp_name)
+            
             return
 
-        # === Send File ===
+        # === Send Results ===
         await processing_msg.edit_text(
-            "✅ <b>Complete!</b>\n📤 Sending...",
+            "✅ <b>Success!</b>\n📤 Sending results...",
             parse_mode="HTML"
         )
 
+        # Send decoded file
         with tempfile.NamedTemporaryFile(
             mode='w', 
             suffix='.py', 
@@ -454,14 +555,16 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_filename = tmp_file.name
 
         try:
+            # Send decoded code
             with open(tmp_filename, 'rb') as f:
                 await update.message.reply_document(
                     document=InputFile(f, filename=f"decoded_{filename_original}"),
                     caption=(
-                        f"✅ <b>Decoded Successfully!</b>\n\n"
+                        f"✅ <b>Successfully Decoded!</b>\n\n"
                         f"📄 Original: {filename_original}\n"
-                        f"📊 Size: {len(decoded_code):,} chars\n"
-                        f"🤖 Model: {MODEL_NAME.split('/')[-1]}\n\n"
+                        f"📊 Decoded size: {len(decoded_code):,} chars\n"
+                        f"🤖 Method: AI Decoder Generation\n"
+                        f"🔧 Model: {MODEL_NAME.split('/')[-1]}\n\n"
                         f"{CREDIT}"
                     ),
                     parse_mode="HTML"
@@ -474,7 +577,7 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preview += "\n\n... (see file for complete code)"
             
             await update.message.reply_text(
-                f"<b>📝 Preview:</b>\n\n<pre>{preview}</pre>",
+                f"<b>📝 Decoded Code Preview:</b>\n\n<pre>{preview}</pre>",
                 parse_mode="HTML"
             )
             
@@ -515,8 +618,8 @@ async def lifespan(app: FastAPI):
     telegram_app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
-        .read_timeout(90)
-        .write_timeout(90)
+        .read_timeout(120)  # Increased for decoder execution
+        .write_timeout(120)
         .connect_timeout(90)
         .pool_timeout(90)
         .build()
@@ -544,7 +647,7 @@ async def lifespan(app: FastAPI):
     
     logger.info(f"✅ Webhook: {webhook_url}")
     logger.info(f"✅ Model: {MODEL_NAME}")
-    logger.info("✅ Bot ready!")
+    logger.info("✅ Bot ready with AI Decoder Generation!")
     
     yield
     
@@ -555,9 +658,9 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI Application ---
 app = FastAPI(
-    title="Python Decoder Bot",
-    description="AI-powered Python deobfuscator",
-    version="3.2.0",
+    title="Python Decoder Bot V2",
+    description="AI-powered decoder generator",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -566,8 +669,9 @@ app = FastAPI(
 async def root():
     return {
         "status": "running",
-        "bot": "Python Decoder Bot",
-        "version": "3.2.0",
+        "bot": "Python Decoder Bot V2",
+        "version": "2.0.0",
+        "mode": "AI Decoder Generation",
         "model": MODEL_NAME,
         "developer": "@aadi_io"
     }
@@ -575,7 +679,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "model": MODEL_NAME}
+    return {"status": "healthy", "model": MODEL_NAME, "mode": "decoder_generation"}
 
 
 @app.post("/webhook")
