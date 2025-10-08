@@ -11,6 +11,7 @@ import re
 import zipfile
 import io
 import html
+import ast
 from contextlib import asynccontextmanager
 from typing import Optional
 import traceback
@@ -27,7 +28,7 @@ from telegram.ext import (
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
-# --- Logging Configuration ---
+# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -40,409 +41,450 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 10000))
 
-# --- Validation ---
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN not set!")
-if not GEMINI_API_KEY:
-    raise ValueError("❌ GEMINI_API_KEY not set!")
-if not WEBHOOK_URL:
-    raise ValueError("❌ WEBHOOK_URL not set!")
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not WEBHOOK_URL:
+    raise ValueError("❌ Missing environment variables!")
 
-# --- Initialize Gemini AI ---
+# --- Gemini Init ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-def get_best_model():
-    """Get best Gemini model."""
+def get_model():
     try:
-        available = []
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
-                available.append(m.name)
-        
-        preferred = [
-            'models/gemini-2.5-flash-lite',
-            'models/gemini-flash-lite-latest',
-            'models/gemini-flash-latest',
-            'models/gemini-pro',
-        ]
-        
-        for pref in preferred:
-            if pref in available:
-                logger.info(f"✅ Model: {pref}")
-                return pref
-        
-        return available[0] if available else 'models/gemini-pro'
+                logger.info(f"Using: {m.name}")
+                return genai.GenerativeModel(m.name)
     except:
-        return 'models/gemini-pro'
+        pass
+    return genai.GenerativeModel('models/gemini-pro')
 
-MODEL_NAME = get_best_model()
-model = genai.GenerativeModel(MODEL_NAME)
+model = get_model()
 
 # --- Constants ---
 CREDIT = "Dev: @aadi_io"
 MAX_FILE_SIZE = 10 * 1024 * 1024
-MAX_ITERATIONS = 50
+MAX_ITERATIONS = 100
 
-# --- Global Bot Application ---
 telegram_app: Optional[Application] = None
 
 
-# --- MANUAL DECODING FUNCTIONS ---
+# --- AGGRESSIVE DECODING FUNCTIONS ---
 
-def extract_from_exec(code: str) -> str:
-    """Extract code from exec() calls."""
+def safe_eval_decode(code_str: str) -> str:
+    """Safely evaluate and decode expressions."""
+    try:
+        # Try to evaluate the expression
+        result = eval(code_str, {"__builtins__": {}}, {
+            "base64": base64,
+            "zlib": zlib,
+            "marshal": marshal,
+            "bytes": bytes,
+            "bytearray": bytearray,
+        })
+        
+        if isinstance(result, bytes):
+            return result.decode('utf-8', errors='ignore')
+        elif isinstance(result, str):
+            return result
+        else:
+            return str(result)
+    except:
+        return code_str
+
+
+def extract_all_base64(code: str) -> str:
+    """Extract and decode ALL base64 in code."""
+    logger.info("🔍 Extracting base64...")
+    
+    # Pattern 1: base64.b64decode(...)
+    pattern1 = r"base64\.b64decode\s*KATEX_INLINE_OPEN\s*([^)]+)\s*KATEX_INLINE_CLOSE"
+    matches = re.findall(pattern1, code)
+    
+    for match in matches:
+        try:
+            decoded = safe_eval_decode(match)
+            if decoded and len(decoded) > 10:
+                code = code.replace(f"base64.b64decode({match})", f'"""{decoded}"""')
+                logger.info(f"✅ Decoded base64 expression")
+        except:
+            pass
+    
+    # Pattern 2: Standalone long base64 strings
+    pattern2 = r"[b]?['\"]([A-Za-z0-9+/=]{200,})['\"]"
+    matches = re.findall(pattern2, code)
+    
+    for match in matches:
+        try:
+            decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
+            if decoded and len(decoded) > 10 and decoded.isprintable():
+                code = code.replace(match, decoded)
+                logger.info(f"✅ Decoded standalone base64")
+        except:
+            pass
+    
+    return code
+
+
+def extract_from_zip_aggressive(code: str) -> str:
+    """Aggressively extract ZIP files."""
+    logger.info("📦 Checking for ZIP...")
+    
+    # Find all base64 strings
+    pattern = r"['\"]([A-Za-z0-9+/=]{500,})['\"]"
+    matches = re.findall(pattern, code)
+    
+    for match in matches:
+        try:
+            decoded_bytes = base64.b64decode(match)
+            
+            # Check if it's a ZIP (multiple signatures)
+            if (decoded_bytes[:2] == b'PK' or 
+                decoded_bytes[:4] == b'PK\x03\x04' or
+                decoded_bytes[:4] == b'PK\x05\x06'):
+                
+                logger.info("🎯 Found ZIP file!")
+                
+                try:
+                    with zipfile.ZipFile(io.BytesIO(decoded_bytes)) as zf:
+                        all_content = []
+                        
+                        for name in zf.namelist():
+                            try:
+                                file_content = zf.read(name).decode('utf-8', errors='ignore')
+                                logger.info(f"  📄 Extracted: {name} ({len(file_content)} chars)")
+                                all_content.append(f"# File: {name}\n{file_content}")
+                            except:
+                                continue
+                        
+                        if all_content:
+                            return "\n\n".join(all_content)
+                except Exception as e:
+                    logger.error(f"ZIP extraction error: {e}")
+        except:
+            continue
+    
+    return code
+
+
+def extract_exec_eval(code: str) -> str:
+    """Extract from exec/eval calls."""
+    logger.info("🔓 Extracting exec/eval...")
+    
+    # Patterns for exec/eval
     patterns = [
-        r'exec\s*KATEX_INLINE_OPEN\s*(.+?)\s*KATEX_INLINE_CLOSE\s*$',
-        r'exec\s*KATEX_INLINE_OPEN\s*(.+?)\s*,',
-        r'eval\s*KATEX_INLINE_OPEN\s*(.+?)\s*KATEX_INLINE_CLOSE',
-        r'compile\s*KATEX_INLINE_OPEN\s*(.+?)\s*,',
+        r'exec\s*KATEX_INLINE_OPEN\s*([^)]+)\s*KATEX_INLINE_CLOSE',
+        r'eval\s*KATEX_INLINE_OPEN\s*([^)]+)\s*KATEX_INLINE_CLOSE',
+        r'compile\s*KATEX_INLINE_OPEN\s*([^,]+)',
     ]
     
     for pattern in patterns:
-        match = re.search(pattern, code, re.DOTALL | re.MULTILINE)
-        if match:
-            inner = match.group(1).strip()
-            logger.info(f"Extracted from exec/eval")
-            return inner
+        matches = re.findall(pattern, code, re.DOTALL)
+        for match in matches:
+            try:
+                # Try to decode the expression
+                decoded = safe_eval_decode(match.strip())
+                if decoded and decoded != match and len(decoded) > 20:
+                    logger.info(f"✅ Extracted from exec/eval")
+                    return decoded
+            except:
+                pass
     
     return code
 
 
-def decode_base64_strings(code: str) -> str:
-    """Decode base64 strings."""
-    try:
-        # Pattern: base64.b64decode(b'...')
-        pattern = r"base64\.b64decode\s*KATEX_INLINE_OPEN\s*[b]?['\"]([A-Za-z0-9+/=]+)['\"]\s*KATEX_INLINE_CLOSE"
-        
-        def replacer(match):
-            encoded = match.group(1)
-            try:
-                decoded = base64.b64decode(encoded).decode('utf-8', errors='ignore')
-                logger.info(f"Decoded base64 chunk")
-                return f'"""{decoded}"""'
-            except:
-                return match.group(0)
-        
-        code = re.sub(pattern, replacer, code)
-        
-        # Find standalone base64 strings
-        pattern2 = r"[b]?['\"]([A-Za-z0-9+/=]{100,})['\"]"
-        matches = re.findall(pattern2, code)
-        
-        for match in matches:
-            try:
-                decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
-                if len(decoded) > 20:
-                    code = code.replace(match, decoded)
-                    logger.info(f"Decoded standalone base64")
-            except:
-                pass
-        
-        return code
-    except Exception as e:
-        logger.error(f"Base64 error: {e}")
-        return code
+def decode_all_zlib(code: str) -> str:
+    """Decode all zlib compressed data."""
+    logger.info("🗜️ Checking zlib...")
+    
+    pattern = r"zlib\.decompress\s*KATEX_INLINE_OPEN\s*([^)]+)\s*KATEX_INLINE_CLOSE"
+    matches = re.findall(pattern, code)
+    
+    for match in matches:
+        try:
+            decoded = safe_eval_decode(match)
+            if decoded and len(decoded) > 10:
+                code = code.replace(f"zlib.decompress({match})", f'"""{decoded}"""')
+                logger.info(f"✅ Decoded zlib")
+        except:
+            pass
+    
+    return code
 
 
-def extract_from_zip(code: str) -> str:
-    """Extract ZIP files from code."""
-    try:
-        # Find base64 data
-        pattern = r"['\"]([A-Za-z0-9+/=]{500,})['\"]"
+def decode_marshal(code: str) -> str:
+    """Decode marshal data."""
+    logger.info("🔐 Checking marshal...")
+    
+    pattern = r"marshal\.loads\s*KATEX_INLINE_OPEN\s*([^)]+)\s*KATEX_INLINE_CLOSE"
+    matches = re.findall(pattern, code)
+    
+    for match in matches:
+        try:
+            data = safe_eval_decode(match)
+            if data:
+                logger.info(f"✅ Found marshal data")
+                # Marshal usually contains code objects, try to extract strings
+                if hasattr(data, 'co_consts'):
+                    consts = str(data.co_consts)
+                    return consts
+        except:
+            pass
+    
+    return code
+
+
+def decode_hex(code: str) -> str:
+    """Decode hex strings."""
+    logger.info("🔢 Checking hex...")
+    
+    patterns = [
+        r"bytes\.fromhex\s*KATEX_INLINE_OPEN\s*['\"]([0-9a-fA-F]+)['\"]\s*KATEX_INLINE_CLOSE",
+        r"bytearray\.fromhex\s*KATEX_INLINE_OPEN\s*['\"]([0-9a-fA-F]+)['\"]\s*KATEX_INLINE_CLOSE",
+    ]
+    
+    for pattern in patterns:
         matches = re.findall(pattern, code)
-        
         for match in matches:
             try:
-                decoded_data = base64.b64decode(match)
-                
-                # Check if ZIP
-                if decoded_data[:2] == b'PK':
-                    logger.info("Found ZIP file!")
-                    
-                    with zipfile.ZipFile(io.BytesIO(decoded_data)) as zf:
-                        names = zf.namelist()
-                        if names:
-                            # Try to find main file
-                            main_file = None
-                            for name in names:
-                                if '__main__' in name or name.endswith('.py'):
-                                    main_file = name
-                                    break
-                            
-                            if not main_file:
-                                main_file = names[0]
-                            
-                            content = zf.read(main_file).decode('utf-8', errors='ignore')
-                            logger.info(f"Extracted {main_file}: {len(content)} chars")
-                            return content
-            except:
-                continue
-        
-        return code
-    except Exception as e:
-        logger.error(f"ZIP error: {e}")
-        return code
-
-
-def decode_zlib(code: str) -> str:
-    """Decode zlib."""
-    try:
-        pattern = r"zlib\.decompress\s*KATEX_INLINE_OPEN\s*(.+?)\s*KATEX_INLINE_CLOSE"
-        match = re.search(pattern, code, re.DOTALL)
-        
-        if match:
-            data_expr = match.group(1).strip()
-            try:
-                data = eval(data_expr)
-                decoded = zlib.decompress(data).decode('utf-8', errors='ignore')
-                logger.info(f"Decoded zlib")
-                return decoded
+                decoded = bytes.fromhex(match).decode('utf-8', errors='ignore')
+                if decoded:
+                    code = code.replace(match, decoded)
+                    logger.info(f"✅ Decoded hex")
             except:
                 pass
-        
-        return code
-    except:
-        return code
+    
+    return code
 
 
-def is_still_obfuscated(code: str) -> bool:
-    """Check if obfuscated."""
+def is_obfuscated(code: str) -> bool:
+    """Check if code is still obfuscated."""
     if not code or len(code) < 10:
         return True
     
+    # Check for obfuscation indicators
     indicators = [
-        'exec(',
-        'eval(',
-        'compile(',
-        'base64.b64decode',
-        'marshal.loads',
-        'zlib.decompress',
-        '__import__',
+        (r'exec\s*KATEX_INLINE_OPEN', 'exec()'),
+        (r'eval\s*KATEX_INLINE_OPEN', 'eval()'),
+        (r'compile\s*KATEX_INLINE_OPEN', 'compile()'),
+        (r'base64\.b64decode', 'base64'),
+        (r'base64\.b32decode', 'base32'),
+        (r'marshal\.loads', 'marshal'),
+        (r'zlib\.decompress', 'zlib'),
+        (r'__import__.*base64', 'import base64'),
+        (r"['\"][A-Za-z0-9+/=]{300,}['\"]", 'long base64 string'),
     ]
     
-    for indicator in indicators:
-        if indicator in code:
+    for pattern, name in indicators:
+        if re.search(pattern, code):
+            logger.info(f"⚠️ Still obfuscated: {name}")
             return True
     
-    # Check for long base64
-    if re.search(r"['\"][A-Za-z0-9+/=]{200,}['\"]", code):
-        return True
-    
+    logger.info("✅ Code appears clean")
     return False
 
 
-def manual_decode_layer(code: str) -> str:
-    """Decode one layer manually."""
+def aggressive_decode_layer(code: str) -> str:
+    """One aggressive decode pass."""
     original = code
     
-    code = extract_from_zip(code)
-    if code != original:
+    # Try ZIP extraction first (most common)
+    code = extract_from_zip_aggressive(code)
+    if code != original and len(code) > len(original) * 0.1:
+        logger.info("🎯 ZIP extraction successful!")
         return code
     
-    code = decode_base64_strings(code)
-    code = extract_from_exec(code)
-    code = decode_zlib(code)
+    # Try other methods
+    code = extract_all_base64(code)
+    code = decode_all_zlib(code)
+    code = decode_marshal(code)
+    code = decode_hex(code)
+    code = extract_exec_eval(code)
     
     return code
 
 
-# --- AI VERIFICATION ---
+# --- AI DECODER ---
 
-async def ai_verify_and_clean(code: str) -> tuple[bool, str]:
-    """Use Gemini to verify and clean up decoded code."""
+async def ai_decode(code: str) -> tuple[bool, str]:
+    """Use AI to decode when manual methods fail."""
     try:
-        logger.info("🤖 AI verification...")
+        logger.info("🤖 AI decode attempt...")
         
-        # Truncate if too long
-        code_sample = code[:20000] if len(code) > 20000 else code
+        # Take sample
+        sample = code[:15000] if len(code) > 15000 else code
         
         prompt = (
-            "You are a Python code cleaner. The following code has been partially decoded from obfuscation.\n\n"
-            "YOUR TASK:\n"
-            "1. Check if ANY obfuscation remains (exec, eval, base64, etc.)\n"
-            "2. If obfuscated, decode it completely\n"
-            "3. Return ONLY clean, readable Python code\n"
-            "4. Remove ALL encoding/obfuscation\n"
-            "5. NO explanations, just code\n\n"
-            f"CODE:\n{code_sample}\n\n"
-            "CLEAN CODE:"
+            "Decode this obfuscated Python code. Extract ALL hidden code.\n"
+            "If it contains base64, ZIP files, exec/eval, or any encoding - decode it ALL.\n"
+            "Return ONLY the final clean Python code with NO obfuscation.\n"
+            "Do not include explanations or markdown.\n\n"
+            f"CODE:\n{sample}\n\n"
+            "DECODED:"
         )
 
-        safety_settings = {
+        safety = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
         
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.1,
+        config = genai.types.GenerationConfig(
+            temperature=0.2,
             max_output_tokens=16384,
         )
         
         loop = asyncio.get_event_loop()
-        
         response = await loop.run_in_executor(
             None,
-            lambda: model.generate_content(
-                prompt,
-                generation_config=generation_config,
-                safety_settings=safety_settings
-            )
+            lambda: model.generate_content(prompt, generation_config=config, safety_settings=safety)
         )
         
-        # Extract response
+        # Extract text
         if response and hasattr(response, 'candidates') and response.candidates:
             candidate = response.candidates[0]
-            
             if hasattr(candidate, 'content') and candidate.content:
                 if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                    text_parts = []
+                    parts = []
                     for part in candidate.content.parts:
                         if hasattr(part, 'text'):
-                            text_parts.append(part.text)
+                            parts.append(part.text)
                     
-                    if text_parts:
-                        result = ''.join(text_parts).strip()
+                    if parts:
+                        result = ''.join(parts).strip()
                         
                         # Clean markdown
-                        if result.startswith("```python"):
-                            result = result[9:]
-                        elif result.startswith("```"):
-                            result = result[3:]
-                        if result.endswith("```"):
-                            result = result[:-3]
+                        result = result.replace("```python", "").replace("```", "").strip()
                         
-                        result = result.strip()
-                        
-                        if len(result) > 20:
-                            logger.info(f"✅ AI cleaned: {len(result)} chars")
+                        if len(result) > 50:
+                            logger.info(f"✅ AI decoded: {len(result)} chars")
                             return True, result
         
         return False, code
         
     except Exception as e:
-        logger.error(f"AI verification error: {e}")
+        logger.error(f"AI error: {e}")
         return False, code
 
 
-# --- FULL DECODING PROCESS ---
+# --- MAIN DECODE LOOP ---
 
-async def full_decode(code: str, chat_id: int, status_msg_id: int) -> tuple[str, int]:
-    """Full decoding with manual + AI."""
-    iteration = 0
+async def complete_decode(code: str, chat_id: int, msg_id: int) -> tuple[str, int]:
+    """Decode until absolutely nothing is left."""
     
     for iteration in range(1, MAX_ITERATIONS + 1):
-        logger.info(f"🔄 Iteration {iteration}")
+        logger.info(f"\n{'='*50}")
+        logger.info(f"🔄 ITERATION {iteration}/{MAX_ITERATIONS}")
+        logger.info(f"{'='*50}")
         
-        # Update user every 3 iterations
-        if iteration % 3 == 0:
+        # Update user
+        if iteration % 2 == 0:
             try:
                 await telegram_app.bot.edit_message_text(
                     chat_id=chat_id,
-                    message_id=status_msg_id,
-                    text=f"🔄 <b>Decoding...</b>\n\nLayer {iteration} processing...",
+                    message_id=msg_id,
+                    text=f"🔄 <b>Deep Decoding...</b>\n\nLayer {iteration} of {MAX_ITERATIONS}\n\n<i>Please wait...</i>",
                     parse_mode="HTML"
                 )
             except:
                 pass
         
         # Check if clean
-        if not is_still_obfuscated(code):
-            logger.info(f"✅ Clean after {iteration} iterations")
-            
-            # Final AI verification
-            success, verified = await ai_verify_and_clean(code)
-            if success and len(verified) > len(code) * 0.8:
-                return verified, iteration
+        if not is_obfuscated(code):
+            logger.info(f"✅✅✅ FULLY DECODED in {iteration} iterations!")
             return code, iteration
         
         # Manual decode
+        logger.info("🔧 Manual decode...")
         new_code = await asyncio.get_event_loop().run_in_executor(
-            None, manual_decode_layer, code
+            None, aggressive_decode_layer, code
         )
         
-        # If manual didn't change, try AI
+        # Check if manual worked
+        if new_code != code and len(new_code) >= len(code) * 0.5:
+            logger.info(f"✅ Manual decode made progress: {len(code)} -> {len(new_code)}")
+            code = new_code
+            continue
+        
+        # Try AI every 3 iterations or if stuck
+        if iteration % 3 == 0 or new_code == code:
+            logger.info("🤖 Trying AI decode...")
+            success, ai_code = await ai_decode(code)
+            
+            if success and ai_code != code and len(ai_code) >= len(code) * 0.5:
+                logger.info(f"✅ AI decode made progress: {len(code)} -> {len(ai_code)}")
+                code = ai_code
+                continue
+        
+        # If nothing worked
         if new_code == code:
-            logger.info("Manual decode stuck, trying AI...")
-            success, ai_code = await ai_verify_and_clean(code)
+            logger.warning(f"⚠️ Stuck at iteration {iteration}")
+            # Try AI one more time
+            success, ai_code = await ai_decode(code)
             if success and ai_code != code:
-                new_code = ai_code
+                code = ai_code
             else:
+                logger.warning("❌ Cannot decode further")
                 break
         
-        if len(new_code) < 10:
+        code = new_code if new_code != code else code
+        
+        # Prevent infinite loops on small changes
+        if iteration > 5 and len(code) < 100:
+            logger.warning("Code too small, stopping")
             break
-        
-        code = new_code
-        
-        # Small delay
-        if iteration % 5 == 0:
-            await asyncio.sleep(1)
     
-    # Final AI pass
-    logger.info("Final AI verification...")
-    success, verified = await ai_verify_and_clean(code)
-    if success:
-        return verified, iteration
-    
+    # Final check
+    logger.info(f"🏁 Decode complete: {iteration} iterations")
     return code, iteration
 
 
-# --- Background Processing ---
+# --- Background Task ---
 
-async def process_decode_task(chat_id: int, code: str, filename: str, status_msg_id: int):
-    """Background decoding."""
+async def decode_task(chat_id: int, code: str, filename: str, msg_id: int):
+    """Background decode."""
     try:
         logger.info(f"🚀 Starting decode for {chat_id}")
         
         # Decode
-        decoded_code, iterations = await full_decode(code, chat_id, status_msg_id)
+        decoded, iterations = await complete_decode(code, chat_id, msg_id)
         
-        # Verify final state
-        still_obfuscated = is_still_obfuscated(decoded_code)
-        status_icon = "✅" if not still_obfuscated else "⚠️"
-        status_text = "Fully Decoded" if not still_obfuscated else "Partially Decoded"
+        # Check status
+        clean = not is_obfuscated(decoded)
+        status = "✅ Fully Decoded" if clean else "⚠️ Partially Decoded"
         
-        # Save file
+        # Save
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
-            tmp.write(decoded_code)
-            tmp_name = tmp.name
+            tmp.write(decoded)
+            tmp_path = tmp.name
         
         try:
             # Send file
-            with open(tmp_name, 'rb') as f:
+            with open(tmp_path, 'rb') as f:
                 await telegram_app.bot.send_document(
                     chat_id=chat_id,
                     document=InputFile(f, filename=f"decoded_{filename}"),
                     caption=(
-                        f"{status_icon} <b>{status_text}</b>\n\n"
+                        f"{status}\n\n"
                         f"📄 {filename}\n"
-                        f"📊 {len(decoded_code):,} chars\n"
-                        f"🔄 {iterations} layers\n\n"
+                        f"📊 {len(decoded):,} chars\n"
+                        f"🔄 {iterations} layers\n"
+                        f"{'🎯 100% Clean' if clean else '⚠️ Some obfuscation may remain'}\n\n"
                         f"{CREDIT}"
                     ),
                     parse_mode="HTML"
                 )
             
-            # Send preview - PROPERLY ESCAPED
-            preview_len = min(3800, len(decoded_code))
-            preview = decoded_code[:preview_len]
-            if len(decoded_code) > 3800:
-                preview += "\n..."
-            
-            # Escape HTML entities
-            preview_escaped = html.escape(preview)
+            # Send preview
+            preview = decoded[:3500] if len(decoded) > 3500 else decoded
+            preview_safe = html.escape(preview)
             
             try:
                 await telegram_app.bot.send_message(
                     chat_id=chat_id,
-                    text=f"<b>📝 Preview:</b>\n\n<pre>{preview_escaped}</pre>",
+                    text=f"<b>Preview:</b>\n\n<pre>{preview_safe}</pre>",
                     parse_mode="HTML"
                 )
-            except Exception as e:
-                # If HTML parsing still fails, send as plain text
-                logger.error(f"Preview send error: {e}")
+            except:
                 await telegram_app.bot.send_message(
                     chat_id=chat_id,
                     text=f"Preview:\n\n{preview[:4000]}"
@@ -450,55 +492,48 @@ async def process_decode_task(chat_id: int, code: str, filename: str, status_msg
             
             # Delete status
             try:
-                await telegram_app.bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
+                await telegram_app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except:
                 pass
-            
-        finally:
-            os.remove(tmp_name)
         
-        logger.info(f"✅ Completed for {chat_id}")
+        finally:
+            os.remove(tmp_path)
+        
+        logger.info(f"✅ Done for {chat_id}")
         
     except Exception as e:
-        logger.error(f"❌ Task error: {e}")
+        logger.error(f"❌ Error: {e}")
         logger.error(traceback.format_exc())
         
         try:
-            error_text = html.escape(str(e)[:300])
             await telegram_app.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ <b>Decoding Error</b>\n\n<code>{error_text}</code>",
-                parse_mode="HTML"
+                text=f"❌ Error\n\n{html.escape(str(e)[:300])}"
             )
         except:
-            await telegram_app.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Decoding failed"
-            )
+            pass
 
 
-# --- Command Handlers ---
+# --- Commands ---
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome."""
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Python Decoder</b>\n\n"
         "Send obfuscated .py file\n"
-        "Get fully decoded code\n\n"
+        "Get 100% decoded code\n\n"
         f"<i>{CREDIT}</i>",
         parse_mode="HTML"
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help."""
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "<b>How to use:</b>\n\n"
-        "1. Send .py file or code\n"
-        "2. Wait 1-5 minutes\n"
+        "<b>Usage:</b>\n\n"
+        "1. Send .py file\n"
+        "2. Wait 2-10 minutes\n"
         "3. Get decoded file\n\n"
-        "• Unlimited layers\n"
-        "• AI verification\n"
+        "• Up to 100 layers\n"
+        "• AI + Manual decoding\n"
         "• Background processing\n\n"
         f"<i>{CREDIT}</i>",
         parse_mode="HTML"
@@ -507,8 +542,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Message Handler ---
 
-async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle input."""
+async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = ""
     filename = "code.py"
     
@@ -517,17 +551,16 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc = update.message.document
             
             if not doc.file_name.endswith('.py'):
-                await update.message.reply_text("⚠️ Send .py file")
+                await update.message.reply_text("⚠️ Send .py file only")
                 return
             
             if doc.file_size > MAX_FILE_SIZE:
-                await update.message.reply_text("⚠️ File too large")
+                await update.message.reply_text(f"⚠️ Max {MAX_FILE_SIZE//1024//1024}MB")
                 return
             
             filename = doc.file_name
             file = await doc.get_file()
-            file_bytes = await file.download_as_bytearray()
-            code = file_bytes.decode('utf-8', errors='ignore')
+            code = (await file.download_as_bytearray()).decode('utf-8', errors='ignore')
             
         elif update.message.text:
             code = update.message.text
@@ -535,39 +568,31 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if not code.strip():
-            await update.message.reply_text("⚠️ Empty code")
             return
 
-        # Send status
-        status_msg = await update.message.reply_text(
+        # Status
+        msg = await update.message.reply_text(
             "🚀 <b>Decoding Started</b>\n\n"
-            "⏳ Takes 1-5 minutes\n\n"
-            "You can leave this chat.\n"
+            "⏳ This may take 2-10 minutes\n"
+            "Processing up to 100 layers\n\n"
+            "You can close Telegram.\n"
             "File will be sent automatically!\n\n"
-            "<i>Processing...</i>",
+            "<i>Deep decoding in progress...</i>",
             parse_mode="HTML"
         )
         
-        # Start task
-        asyncio.create_task(
-            process_decode_task(
-                update.effective_chat.id,
-                code,
-                filename,
-                status_msg.message_id
-            )
-        )
+        # Start
+        asyncio.create_task(decode_task(update.effective_chat.id, code, filename, msg.message_id))
         
     except Exception as e:
         logger.error(f"Handler error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+        await update.message.reply_text("❌ Error")
 
 
-# --- Lifespan ---
+# --- App Lifecycle ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle."""
     global telegram_app
     
     logger.info("🚀 Starting...")
@@ -580,23 +605,13 @@ async def lifespan(app: FastAPI):
         .build()
     )
     
-    telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("help", help_command))
-    telegram_app.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.Document.PY) & ~filters.COMMAND,
-            handle_code_input
-        )
-    )
+    telegram_app.add_handler(CommandHandler("start", start_cmd))
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
+    telegram_app.add_handler(MessageHandler((filters.TEXT | filters.Document.PY) & ~filters.COMMAND, handle_input))
     
     await telegram_app.initialize()
     await telegram_app.start()
-    
-    await telegram_app.bot.set_webhook(
-        url=f"{WEBHOOK_URL}/webhook",
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    await telegram_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
     
     logger.info("✅ Ready!")
     
@@ -608,37 +623,32 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI ---
 
-app = FastAPI(title="Python Decoder", version="6.0.0", lifespan=lifespan)
-
+app = FastAPI(title="Decoder", version="7.0.0", lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"status": "running", "version": "6.0.0"}
-
+    return {"status": "running", "version": "7.0.0"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
-
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
-        json_data = await request.json()
-        update = Update.de_json(json_data, telegram_app.bot)
+        data = await request.json()
+        update = Update.de_json(data, telegram_app.bot)
         await telegram_app.process_update(update)
         return Response(status_code=200)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook: {e}")
         return Response(status_code=500)
-
 
 @app.head("/")
 @app.head("/health")
-async def head_health():
+async def head():
     return Response(status_code=200)
-
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
