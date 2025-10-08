@@ -95,7 +95,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{TELEGRAM_BOT_TOKEN}")
 
 # Build the application
-# The `app` object is created at the top level so the ASGI server can find it.
+# The `application` object is created at the top level so the ASGI server can find it.
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set!")
 
@@ -109,7 +109,4 @@ application = (
 # Register handlers
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler((filters.TEXT | filters.Document.PY) & ~filters.COMMAND, handle_input))
-
-# Note: There is no `if __name__ == "__main__":` block to run the bot.
-# The ASGI server (Uvicorn) will import the `application` object and run it.
 
