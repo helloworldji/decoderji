@@ -3,6 +3,7 @@ import tempfile
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
+import asyncio
 
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InputFile
@@ -39,33 +40,55 @@ if not WEBHOOK_URL:
 # --- Initialize Gemini AI ---
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Try different model names with fallback
-MODEL_NAMES = [
-    'gemini-1.5-flash-latest',
-    'gemini-1.5-pro-latest', 
-    'gemini-1.5-flash',
-    'gemini-1.5-pro',
-    'gemini-pro'
-]
-
-model = None
-for model_name in MODEL_NAMES:
+# List and find available models
+def get_available_model():
+    """Get the best available Gemini model."""
     try:
-        model = genai.GenerativeModel(model_name)
-        logger.info(f"✅ Successfully initialized Gemini model: {model_name}")
-        break
+        logger.info("🔍 Searching for available Gemini models...")
+        available_models = []
+        
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+                logger.info(f"  ✓ Found: {m.name}")
+        
+        # Preferred models in order
+        preferred = [
+            'models/gemini-1.5-flash',
+            'models/gemini-1.5-pro',
+            'models/gemini-pro',
+            'models/gemini-1.0-pro',
+        ]
+        
+        # Find first available preferred model
+        for model_name in preferred:
+            if model_name in available_models:
+                logger.info(f"✅ Selected model: {model_name}")
+                return model_name
+        
+        # If none of the preferred models, use first available
+        if available_models:
+            logger.info(f"✅ Using first available model: {available_models[0]}")
+            return available_models[0]
+        
+        raise ValueError("No models support generateContent")
+        
     except Exception as e:
-        logger.warning(f"⚠️ Failed to initialize {model_name}: {e}")
-        continue
+        logger.error(f"❌ Error listing models: {e}")
+        # Fallback to known stable model
+        return 'models/gemini-pro'
 
-if model is None:
-    # Fallback to gemini-pro which should always work
-    try:
-        model = genai.GenerativeModel('gemini-pro')
-        logger.info("✅ Using fallback model: gemini-pro")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize any Gemini model: {e}")
-        raise ValueError("Could not initialize Gemini AI model")
+# Initialize model
+try:
+    MODEL_NAME = get_available_model()
+    model = genai.GenerativeModel(MODEL_NAME)
+    logger.info(f"🤖 Gemini model initialized: {MODEL_NAME}")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize Gemini model: {e}")
+    # Last resort fallback
+    MODEL_NAME = 'models/gemini-pro'
+    model = genai.GenerativeModel(MODEL_NAME)
+    logger.info(f"⚠️ Using fallback model: {MODEL_NAME}")
 
 # --- Constants ---
 CREDIT = "🔧 Dev: @aadi_io"
@@ -106,7 +129,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>📖 Help Guide</b>\n\n"
         "<b>Commands:</b>\n"
         "/start - Start the bot\n"
-        "/help - Show this help message\n\n"
+        "/help - Show this help message\n"
+        "/models - Show current AI model info\n\n"
         "<b>Usage:</b>\n"
         "Simply send me a Python file or paste obfuscated code.\n\n"
         "<b>⚠️ Limitations:</b>\n"
@@ -116,6 +140,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>{CREDIT}</i>"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
+
+
+async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current model information."""
+    model_info = (
+        f"<b>🤖 AI Model Information</b>\n\n"
+        f"<b>Current Model:</b>\n"
+        f"<code>{MODEL_NAME}</code>\n\n"
+        f"<b>Status:</b> ✅ Active\n\n"
+        f"<i>{CREDIT}</i>"
+    )
+    await update.message.reply_text(model_info, parse_mode="HTML")
 
 
 # --- Message Handler ---
@@ -184,13 +220,16 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Code to decode:\n\n{code}"
         )
 
-        # Call Gemini AI with retry logic
+        # Call Gemini AI with proper error handling
         decoded_code = None
-        max_retries = 2
+        max_retries = 3
         
         for attempt in range(max_retries):
             try:
-                response = await model.generate_content_async(
+                logger.info(f"🔄 Attempt {attempt + 1}/{max_retries} to decode code...")
+                
+                # Generate content with configuration
+                response = model.generate_content(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
                         temperature=0.1,
@@ -198,27 +237,47 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         top_k=40,
                         max_output_tokens=8192,
                     ),
-                    safety_settings={
-                        'HARASSMENT': 'BLOCK_NONE',
-                        'HATE_SPEECH': 'BLOCK_NONE',
-                        'SEXUALLY_EXPLICIT': 'BLOCK_NONE',
-                        'DANGEROUS_CONTENT': 'BLOCK_NONE',
-                    }
+                    safety_settings=[
+                        {
+                            "category": "HARM_CATEGORY_HARASSMENT",
+                            "threshold": "BLOCK_NONE",
+                        },
+                        {
+                            "category": "HARM_CATEGORY_HATE_SPEECH",
+                            "threshold": "BLOCK_NONE",
+                        },
+                        {
+                            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                            "threshold": "BLOCK_NONE",
+                        },
+                        {
+                            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                            "threshold": "BLOCK_NONE",
+                        },
+                    ]
                 )
                 
                 decoded_code = response.text.strip()
+                logger.info("✅ Successfully decoded code")
                 break
                 
             except Exception as e:
-                logger.error(f"Gemini API error (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"❌ Gemini API error (attempt {attempt + 1}/{max_retries}): {e}")
+                
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(2)  # Wait before retry
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
                     continue
                 else:
+                    error_msg = str(e)
                     await processing_msg.edit_text(
-                        "❌ Failed to decode the code. The AI service encountered an error.\n\n"
-                        f"Error: {str(e)[:100]}\n\n"
-                        "Please try again later or contact support."
+                        "❌ Failed to decode the code.\n\n"
+                        f"<b>Error:</b> <code>{error_msg[:200]}</code>\n\n"
+                        "Possible solutions:\n"
+                        "• Try with smaller code snippet\n"
+                        "• Check if code is actually obfuscated\n"
+                        "• Try again in a few moments\n\n"
+                        f"If issue persists, contact {CREDIT}",
+                        parse_mode="HTML"
                     )
                     return
 
@@ -255,7 +314,9 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(tmp_filename, 'rb') as f:
                 await update.message.reply_document(
                     document=InputFile(f, filename=f"decoded_{filename_original}"),
-                    caption=f"✅ <b>Decoding Complete!</b>\n\n{CREDIT}",
+                    caption=f"✅ <b>Decoding Complete!</b>\n\n"
+                            f"<b>Model used:</b> <code>{MODEL_NAME.split('/')[-1]}</code>\n\n"
+                            f"{CREDIT}",
                     parse_mode="HTML"
                 )
             
@@ -269,9 +330,17 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error in handle_code_input: {e}", exc_info=True)
-        await update.message.reply_text(
-            "❌ An unexpected error occurred. Please try again or contact support."
-        )
+        try:
+            await update.message.reply_text(
+                f"❌ An unexpected error occurred.\n\n"
+                f"<b>Error:</b> <code>{str(e)[:200]}</code>\n\n"
+                f"Please try again or contact {CREDIT}",
+                parse_mode="HTML"
+            )
+        except:
+            await update.message.reply_text(
+                "❌ An unexpected error occurred. Please try again or contact support."
+            )
 
 
 # --- Application Lifespan ---
@@ -289,12 +358,15 @@ async def lifespan(app: FastAPI):
         .token(TELEGRAM_BOT_TOKEN)
         .read_timeout(30)
         .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
         .build()
     )
     
     # Register handlers
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("help", help_command))
+    telegram_app.add_handler(CommandHandler("models", models_command))
     telegram_app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.PY) & ~filters.COMMAND,
@@ -315,7 +387,7 @@ async def lifespan(app: FastAPI):
     )
     
     logger.info(f"✅ Webhook set to: {webhook_url}")
-    logger.info("✅ Bot is ready!")
+    logger.info(f"✅ Bot is ready with model: {MODEL_NAME}")
     
     yield
     
@@ -329,7 +401,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Python Decoder Bot",
     description="Telegram bot for decoding obfuscated Python code",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -340,7 +412,8 @@ async def root():
     return {
         "status": "running",
         "bot": "Python Decoder Bot",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "model": MODEL_NAME,
         "developer": "@aadi_io"
     }
 
@@ -348,7 +421,10 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check for monitoring."""
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "model": MODEL_NAME
+    }
 
 
 @app.post("/webhook")
@@ -379,7 +455,6 @@ async def head_health():
 # --- Main Entry Point ---
 if __name__ == "__main__":
     import uvicorn
-    import asyncio
     
     uvicorn.run(
         app,
