@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # --- Environment Variables ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., https://yourapp.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 10000))
 
 # --- Validation ---
@@ -38,7 +38,34 @@ if not WEBHOOK_URL:
 
 # --- Initialize Gemini AI ---
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+
+# Try different model names with fallback
+MODEL_NAMES = [
+    'gemini-1.5-flash-latest',
+    'gemini-1.5-pro-latest', 
+    'gemini-1.5-flash',
+    'gemini-1.5-pro',
+    'gemini-pro'
+]
+
+model = None
+for model_name in MODEL_NAMES:
+    try:
+        model = genai.GenerativeModel(model_name)
+        logger.info(f"✅ Successfully initialized Gemini model: {model_name}")
+        break
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to initialize {model_name}: {e}")
+        continue
+
+if model is None:
+    # Fallback to gemini-pro which should always work
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+        logger.info("✅ Using fallback model: gemini-pro")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize any Gemini model: {e}")
+        raise ValueError("Could not initialize Gemini AI model")
 
 # --- Constants ---
 CREDIT = "🔧 Dev: @aadi_io"
@@ -157,31 +184,62 @@ async def handle_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Code to decode:\n\n{code}"
         )
 
-        # Call Gemini AI
-        try:
-            response = await model.generate_content_async(prompt)
-            decoded_code = response.text.strip()
-            
-            # Clean up markdown code blocks if present
-            if decoded_code.startswith("```python"):
-                decoded_code = decoded_code[9:]
-            elif decoded_code.startswith("```"):
-                decoded_code = decoded_code[3:]
-            if decoded_code.endswith("```"):
-                decoded_code = decoded_code[:-3]
-            
-            decoded_code = decoded_code.strip()
+        # Call Gemini AI with retry logic
+        decoded_code = None
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                response = await model.generate_content_async(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.1,
+                        top_p=0.95,
+                        top_k=40,
+                        max_output_tokens=8192,
+                    ),
+                    safety_settings={
+                        'HARASSMENT': 'BLOCK_NONE',
+                        'HATE_SPEECH': 'BLOCK_NONE',
+                        'SEXUALLY_EXPLICIT': 'BLOCK_NONE',
+                        'DANGEROUS_CONTENT': 'BLOCK_NONE',
+                    }
+                )
+                
+                decoded_code = response.text.strip()
+                break
+                
+            except Exception as e:
+                logger.error(f"Gemini API error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2)  # Wait before retry
+                    continue
+                else:
+                    await processing_msg.edit_text(
+                        "❌ Failed to decode the code. The AI service encountered an error.\n\n"
+                        f"Error: {str(e)[:100]}\n\n"
+                        "Please try again later or contact support."
+                    )
+                    return
 
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
+        # Validate decoded output
+        if not decoded_code:
             await processing_msg.edit_text(
-                "❌ Failed to decode the code. The AI service encountered an error.\n"
-                "Please try again later or contact support."
+                "⚠️ No response from AI. Please try again."
             )
             return
 
-        # Validate decoded output
-        if not decoded_code or len(decoded_code) < 10:
+        # Clean up markdown code blocks if present
+        if decoded_code.startswith("```python"):
+            decoded_code = decoded_code[9:]
+        elif decoded_code.startswith("```"):
+            decoded_code = decoded_code[3:]
+        if decoded_code.endswith("```"):
+            decoded_code = decoded_code[:-3]
+        
+        decoded_code = decoded_code.strip()
+
+        if len(decoded_code) < 10:
             await processing_msg.edit_text(
                 "⚠️ Decoding failed. The code might be too complex or not actually obfuscated."
             )
@@ -321,6 +379,7 @@ async def head_health():
 # --- Main Entry Point ---
 if __name__ == "__main__":
     import uvicorn
+    import asyncio
     
     uvicorn.run(
         app,
